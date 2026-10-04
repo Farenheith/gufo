@@ -3343,12 +3343,16 @@ void TestToolClosingFraming() {
     std::string content;
   };
   for (const auto& item : std::vector<Case>{
+           {"I'll update `config.py\n" + call, 1, R"({"text":"42"})",
+            "I'll update `config.py\n"},
+           {"Let`s write it.\n" + call, 1, R"({"text":"42"})",
+            "Let`s write it.\n"},
            {"looks like `" + call + "` and no call.", 0, "",
             "looks like `" + call + "` and no call."},
            {"looks like ``" + call + "`` and no call.", 0, "",
             "looks like ``" + call + "`` and no call."},
-           {"looks like `" + call, 0, "", "looks like `" + call},
-           {"looks like ``" + call, 0, "", "looks like ``" + call},
+           {"looks like `" + call, 1, R"({"text":"42"})", "looks like `"},
+           {"looks like ``" + call, 1, R"({"text":"42"})", "looks like ``"},
            {"`example\n\n" + call, 1, R"({"text":"42"})", "`example\n\n"},
            {"looks like `literal <think>\n" + call + "`", 0, "",
             "looks like `literal <think>\n" + call + "`"},
@@ -3473,7 +3477,7 @@ void TestToolClosingFraming() {
   }
 }
 
-void TestUnconstrainedFenceFallbackChecksSchema() {
+void TestUnconstrainedQuoteFallbackChecksSchema() {
   const std::string prefix = "```python\nprint(1)\n";
   const std::string valid =
       "<tool_call>\n<function=f>\n<parameter=text>42</parameter>\n</"
@@ -3494,14 +3498,21 @@ void TestUnconstrainedFenceFallbackChecksSchema() {
            {"looks like `" + valid + "`", false, "looks like `" + valid + "`"},
            {"looks like ``" + valid + "``", false,
             "looks like ``" + valid + "``"},
-           {"looks like `" + valid, false, "looks like `" + valid},
+           {"looks like `" + valid, true, "looks like `"},
+           {"I'll update `config.py\n" + valid, true,
+            "I'll update `config.py\n"},
+           {"Let`s write it.\n" + valid, true, "Let`s write it.\n"},
+           {"looks like ``" + valid, true, "looks like ``"},
+           {"looks like `" + wrong, false, "looks like `" + wrong},
+           {"looks like `" + missing, false, "looks like `" + missing},
+           {"looks like `" + wrong + "\n\n", false,
+            "looks like `" + wrong + "\n\n"},
        }) {
     for (const bool constrained : {false, true}) {
       for (const bool stream : {false, true}) {
         for (const bool bytewise : {false, true}) {
           gufo::server::ChatRequest chat;
           chat.reasoning.enabled = false;
-          chat.constrained_tools = constrained;
           Expect(
               !gufo::server::ParseOpenAiResponseControls(
                   gufo::json::parse(
@@ -3548,7 +3559,8 @@ void TestUnconstrainedFenceFallbackChecksSchema() {
             }
           }
           Expect(calls == (item.call ? 1u : 0u),
-                 "both parser paths apply fence schema checks and protect "
+                 "both parser paths apply unfinished-quote schema checks and "
+                 "protect "
                  "inline quotations");
           Expect(content == item.content,
                  "quoted documentation and invalid fence examples stay "
@@ -3559,6 +3571,109 @@ void TestUnconstrainedFenceFallbackChecksSchema() {
         }
       }
     }
+  }
+}
+
+void TestUnfinishedInlineReasoningFallback() {
+  const std::string prefix = "Check `foo then\n";
+  const std::string valid =
+      "<tool_call><function=f><parameter=text>42</parameter></function></"
+      "tool_call>";
+  const std::string wrong =
+      "<tool_call><function=f><parameter=text>43</parameter></function></"
+      "tool_call>";
+  const std::string missing = "<tool_call><function=f></function></tool_call>";
+  struct Case {
+    std::string text;
+    bool call;
+    std::string reasoning;
+    std::string content;
+  };
+  for (const auto& item : std::vector<Case>{
+           {prefix + valid, true, prefix, ""},
+           {prefix + valid + "</think>", true, prefix, ""},
+           {prefix + wrong, false, prefix + wrong, ""},
+           {prefix + missing, false, prefix + missing, ""},
+           {prefix + wrong + "</think>Answer", false, prefix + wrong, "Answer"},
+           {prefix + valid + "`</think>Answer", false, prefix + valid + "`",
+            "Answer"},
+           {prefix + valid + "`</think>" + valid, true, prefix + valid + "`",
+            ""},
+       }) {
+    for (const bool stream : {false, true})
+      for (const bool bytewise : {false, true}) {
+        gufo::server::ChatRequest chat;
+        chat.reasoning.enabled = true;
+        Expect(
+            !gufo::server::ParseOpenAiResponseControls(
+                gufo::json::parse(
+                    R"({"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"text":{"type":"string","const":"42"}},"required":["text"],"additionalProperties":false}}]})"),
+                &chat),
+            "reasoning fallback fixture has valid controls");
+        // Exercise the legacy implicit transition before </think>. Constrained
+        // reasoning deliberately requires the explicit phase delimiter.
+        chat.constrained_tools = false;
+        FakeBackend backend;
+        backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+        const auto& raw = item.text;
+        if (bytewise)
+          for (const char byte : raw)
+            backend.pieces.emplace_back(1, byte);
+        else
+          backend.pieces = {raw};
+        const auto response = gufo::server::CreateOpenAiResponse(
+            Request("{}"), backend, chat, 512, {}, stream);
+        gufo::json::Value output;
+        std::string streamed_content, streamed_reasoning;
+        if (!stream)
+          output = gufo::json::parse(response.body);
+        else
+          response.streaming_body([&](std::string_view chunk) {
+            const auto event =
+                gufo::json::parse(chunk.substr(chunk.find("data: ") + 6));
+            if (event.member_str("type") == "response.output_text.delta")
+              streamed_content += event.member_str("delta");
+            if (event.member_str("type") ==
+                "response.reasoning_summary_text.delta")
+              streamed_reasoning += event.member_str("delta");
+            if (event.member_str("type") == "response.completed")
+              output = *event.find("response");
+            return true;
+          });
+        std::string content, reasoning;
+        std::size_t calls = 0;
+        for (const auto& part : output.find("output")->items()) {
+          if (part.member_str("type") == "function_call") {
+            ++calls;
+            Expect(part.member_str("name") == "f" &&
+                       part.member_str("arguments") == R"({"text":"42"})",
+                   "recovered reasoning call satisfies its complete schema");
+          }
+          for (const auto* field : {"content", "summary"})
+            if (const auto* parts = part.find(field)) {
+              for (const auto& text : parts->items())
+                (std::string_view(field) == "summary" ? reasoning : content) +=
+                    text.member_str("text");
+            }
+        }
+        if (calls != (item.call ? 1u : 0u) || content != item.content ||
+            Trimmed(reasoning) != Trimmed(item.reasoning)) {
+          std::cerr << "Reasoning fallback: " << raw << "\nstream=" << stream
+                    << " bytewise=" << bytewise << "\ncontent=" << content
+                    << "\nreasoning=" << reasoning << "\ncalls=" << calls
+                    << '\n';
+        }
+        Expect(calls == (item.call ? 1u : 0u),
+               "an unfinished reasoning quote recovers only a declared "
+               "schema-valid call");
+        Expect(content == item.content &&
+                   Trimmed(reasoning) == Trimmed(item.reasoning),
+               "quoted or rejected examples remain in their original phase");
+        if (stream)
+          Expect(streamed_content == content &&
+                     Trimmed(streamed_reasoning) == Trimmed(reasoning),
+                 "held reasoning and content agree with final output");
+      }
   }
 }
 
@@ -3771,7 +3886,8 @@ int main() {
   TestToolNameCharacters();
   TestMalformedHistoricalFunctions();
   TestToolClosingFraming();
-  TestUnconstrainedFenceFallbackChecksSchema();
+  TestUnconstrainedQuoteFallbackChecksSchema();
+  TestUnfinishedInlineReasoningFallback();
   TestProseAboutTheDialectIsNotACall();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();

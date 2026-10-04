@@ -13,9 +13,9 @@ namespace gufo::server {
 inline constexpr std::string_view kThinkStart = "<think>";
 inline constexpr std::string_view kThinkEnd = "</think>";
 
-/// Request-owned quoting state. Inline backticks protect text across nonblank
-/// lines, including unfinished inline spans. Only fences use the unfinished
-/// call fallback; a later closing fence makes the held marker documentation.
+/// Request-owned quoting state. Completed inline spans across nonblank lines
+/// and completed fences protect documentation. Markers in unfinished spans are
+/// held during streaming until a closing delimiter or the final parse decides.
 /// Own the scanned bytes rather than identifying a buffer by its address.
 class QuoteTracker {
 public:
@@ -23,6 +23,7 @@ public:
     origin = std::min(origin, text.size());
     text_.assign(origin, ' ');
     spans_.clear();
+    unfinished_inline_.clear();
     first_nonblank_ = std::string_view::npos;
     run_begin_ = 0;
     run_size_ = 0;
@@ -62,14 +63,25 @@ public:
           AtLineStart(run_begin_) && position >= fence_begin_ &&
           position < run_begin_)
         return true;
-    } else if (inline_size_ > 0 && position >= inline_begin_) {
+    } else if (inline_size_ > 0 && run_char_ == '`' &&
+               run_size_ == inline_size_ && position >= inline_begin_ &&
+               position < run_begin_) {
       return true;
     }
     return false;
   }
 
-  [[nodiscard]] bool UnclosedFenceAt(std::size_t position) const {
-    return !QuotedAt(position) && fence_size_ > 0 && position >= fence_begin_;
+  [[nodiscard]] bool UnclosedAt(std::size_t position) const {
+    if (QuotedAt(position))
+      return false;
+    if ((fence_size_ > 0 && position >= fence_begin_) ||
+        (inline_size_ > 0 && position >= inline_begin_))
+      return true;
+    const auto next = std::upper_bound(
+        unfinished_inline_.begin(), unfinished_inline_.end(), position,
+        [](auto at, const Span& span) { return at < span.begin; });
+    return next != unfinished_inline_.begin() &&
+           position < std::prev(next)->end;
   }
 
   [[nodiscard]] std::size_t bytes_scanned() const noexcept {
@@ -135,9 +147,9 @@ private:
         fence_char_ = 0;
       }
       if (inline_size_ > 0 && first_nonblank_ == std::string_view::npos) {
-        // A blank line ends an unfinished inline quotation, without exposing
-        // the markers it already contained as calls.
-        spans_.push_back({inline_begin_, cursor});
+        // A blank line ends an unfinished inline span. Retain its range so
+        // possible calls still require the schema-checked fallback.
+        unfinished_inline_.push_back({inline_begin_, cursor});
         inline_size_ = 0;
       }
       closing_fence_ = false;
@@ -149,6 +161,7 @@ private:
 
   std::string text_;
   std::vector<Span> spans_;
+  std::vector<Span> unfinished_inline_;
   std::size_t bytes_scanned_{0};
   std::size_t first_nonblank_{std::string_view::npos};
   std::size_t run_begin_{0};

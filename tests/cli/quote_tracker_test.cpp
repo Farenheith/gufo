@@ -23,15 +23,16 @@ void TestCompletedSpans() {
   for (const auto& item : std::vector<Case>{
            {"plain <marker>", false},
            {"`<marker>`", true},
-           {"`<marker>", true},
-           {"`<marker>\nnext", true},
+           {"`<marker>", false},
+           {"`<marker>\nnext", false},
            {"`before\n<marker>\nafter`", true},
            {"``before\n<marker>\nafter``", true},
            {"`before\n\n<marker>", false},
+           {"`<marker>\n\nlater`", false},
            {"`before\n \t\r\n<marker>", false},
            {"`before <think>\n<marker>`", true},
            {"``<marker>``", true},
-           {"``<marker>`", true},
+           {"``<marker>`", false},
            {"```python\n<marker>\n```", true},
            {"```python\n<marker>\n```\n", true},
            {"```python\n<marker>", false},
@@ -64,6 +65,13 @@ void TestUnfinishedFenceDecision() {
   tracker.Append("```\n");
   Expect(tracker.QuotedAt(7),
          "a completed fence turns the held marker into documentation");
+  tracker.Reset("`<marker>\n\n");
+  Expect(!tracker.QuotedAt(1) && tracker.UnclosedAt(1),
+         "a blank-line-terminated inline example still requires schema "
+         "validation");
+  tracker.Reset("`<marker>`");
+  Expect(tracker.QuotedAt(1) && !tracker.UnclosedAt(1),
+         "a complete inline span never uses the fallback");
   tracker.Reset("plain <marker>");
   Expect(!tracker.QuotedAt(6),
          "reset discards the preceding response's quote state");

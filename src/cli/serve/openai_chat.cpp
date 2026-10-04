@@ -1310,7 +1310,8 @@ bool SchemaAccepts(const json::Value& root, const json::Value& original,
 void ParseQwenCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
     std::vector<ParsedToolCall>* calls,
-    std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr) {
+    std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr,
+    bool require_schema = false) {
   constexpr std::string_view start = "<tool_call>";
   constexpr std::string_view end = "</tool_call>";
   QuoteTracker call_quotes;
@@ -1472,9 +1473,9 @@ void ParseQwenCalls(
         std::ranges::none_of(
             tools, [&](const auto& tool) { return tool.name == call.name; }))
       complete = false;
-    if (complete && call_quotes.UnclosedFenceAt(marker_begin)) {
-      // An unfinished fence is ambiguous. Restore the legacy fallback only for
-      // a declared call whose complete arguments satisfy its schema.
+    if (complete && (require_schema || call_quotes.UnclosedAt(marker_begin))) {
+      // An unfinished quotation is ambiguous. Restore the legacy fallback only
+      // for a declared call whose complete arguments satisfy its schema.
       const auto tool =
           std::ranges::find(tools, call.name, &tokenization::ChatTool::name);
       if (tool == tools.end()) {
@@ -1652,6 +1653,8 @@ ParsedGeneration ParseGeneration(
   quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
+  std::string_view reasoning_call_context;
+  bool unfinished_reasoning_quote = false;
   const bool recognize_tools =
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone;
   const auto tool_marker = [recognize_tools, markers,
@@ -1679,6 +1682,8 @@ ParsedGeneration ParseGeneration(
               "model did not produce a declared tool call");
         return parsed;
       }
+      reasoning_call_context = content;
+      unfinished_reasoning_quote = quotes.UnclosedAt(marker);
       parsed.text = std::string(content.substr(marker));
     } else {
       parsed.reasoning_content =
@@ -1726,8 +1731,11 @@ ParsedGeneration ParseGeneration(
         parsed.reasoning_content =
             std::string(Trim(remaining.substr(0, marker)));
         parsed.text = std::string(content.substr(0, think_start));
-        if (marker != std::string_view::npos)
+        if (marker != std::string_view::npos) {
+          reasoning_call_context = remaining;
+          unfinished_reasoning_quote = quotes.UnclosedAt(marker);
           parsed.text += remaining.substr(marker);
+        }
       }
     } else {
       parsed.text = std::string(content);
@@ -1744,14 +1752,32 @@ ParsedGeneration ParseGeneration(
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
     if (text_from_tools.starts_with("<tool_call>"))
-      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls);
+      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
+                     unfinished_reasoning_quote);
     else
       ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
     std::erase_if(parsed.tool_calls, [&](const auto& call) {
       return std::ranges::none_of(
           tools, [&](const auto& tool) { return tool.name == call.name; });
     });
-    if (parsed.tool_calls.empty() && quotes.UnclosedFenceAt(marker) &&
+    if (parsed.tool_calls.empty() && unfinished_reasoning_quote &&
+        choice != ChatRequest::ToolChoice::kRequired) {
+      // The tentative implicit end of reasoning was an invalid quoted example.
+      // Preserve it in its original phase, including a later explicit boundary.
+      const auto end = reasoning_call_context.find(kThinkEnd);
+      if (end != std::string_view::npos) {
+        parsed = ParseGeneration(
+            reasoning_call_context.substr(end + kThinkEnd.size()),
+            TextGenerationBackend::InitialOutputState::kContent, tools, choice,
+            enforce_required, markers, closers, quotes);
+      } else {
+        parsed.text.clear();
+      }
+      parsed.reasoning_content =
+          std::string(reasoning_call_context.substr(0, end));
+      return parsed;
+    }
+    if (parsed.tool_calls.empty() && quotes.UnclosedAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
       return parsed;
     }
@@ -1851,7 +1877,7 @@ ParsedGeneration ParseStructuredGeneration(
                                  cursor > 0);
     }
     if (call.tool_calls.empty() && marker != std::string_view::npos &&
-        quotes.UnclosedFenceAt(marker) &&
+        quotes.UnclosedAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
       parsed.text = std::string(raw);
       return parsed;
@@ -2075,7 +2101,7 @@ public:
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker < end_pos) {
-        if (marker > 0 && !emit_piece_(pending_.substr(0, marker), true))
+        if (marker > 0 && !Emit(pending_.substr(0, marker), true))
           return false;
         hidden_ = pending_.substr(marker);
         pending_.clear();
@@ -2083,7 +2109,7 @@ public:
         return true;
       }
       if (end_pos != std::string::npos) {
-        if (end_pos > 0 && !emit_piece_(pending_.substr(0, end_pos), true)) {
+        if (end_pos > 0 && !Emit(pending_.substr(0, end_pos), true)) {
           return false;
         }
         std::string_view remaining = pending_;
@@ -2106,7 +2132,7 @@ public:
           }
         }
         const std::size_t ready = pending_.size() - held;
-        if (ready > 0 && !emit_piece_(pending_.substr(0, ready), true)) {
+        if (ready > 0 && !Emit(pending_.substr(0, ready), true)) {
           return false;
         }
         pending_.erase(0, ready);
@@ -2138,7 +2164,7 @@ public:
             recognize_tools_
                 ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
                 : std::string_view(pending_).substr(0, marker);
-        if (!prose.empty() && !emit_piece_(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false)) {
           return false;
         }
         hidden_ = pending_.substr(marker);
@@ -2156,7 +2182,7 @@ public:
                          pending_.size())
               : 0;
       const std::size_t ready = pending_.size() - held;
-      if (ready > 0 && !emit_piece_(pending_.substr(0, ready), false)) {
+      if (ready > 0 && !Emit(pending_.substr(0, ready), false)) {
         return false;
       }
       pending_.erase(0, ready);
@@ -2166,13 +2192,20 @@ public:
     return true;
   }
 
-  bool Finish(bool hide_tool_markup, std::string_view content = {}) {
+  bool Finish(bool hide_tool_markup, std::string_view content = {},
+              std::string_view reasoning = {}) {
+    if (tool_mode_ && state_ == State::kThinking) {
+      const auto tail = reasoning.substr(
+          std::min(emitted_reasoning_bytes_, reasoning.size()));
+      return (tail.empty() || Emit(tail, true)) &&
+             (content.empty() || Emit(content, false));
+    }
     if (tool_only_ && tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
       const auto tail = content.substr(offset);
-      return tail.empty() || emit_piece_(tail, false);
+      return tail.empty() || Emit(tail, false);
     }
     if (raw_content_ && !structured_started_ && hide_tool_markup) {
       pending_.clear();
@@ -2188,7 +2221,7 @@ public:
                                               closers_, quotes_, tools_)
                               : std::string_view(pending_);
         const bool is_reasoning = (state_ == State::kThinking);
-        const bool emitted = emit_piece_(text, is_reasoning);
+        const bool emitted = Emit(text, is_reasoning);
         pending_.clear();
         if (!emitted) {
           return false;
@@ -2197,7 +2230,7 @@ public:
       return true;
     }
     if (!hide_tool_markup && !hidden_.empty()) {
-      return emit_piece_(hidden_, false);
+      return Emit(hidden_, false);
     }
     return true;
   }
@@ -2211,6 +2244,14 @@ public:
   }
 
 private:
+  bool Emit(std::string_view piece, bool reasoning) {
+    if (!emit_piece_(piece, reasoning))
+      return false;
+    if (reasoning)
+      emitted_reasoning_bytes_ += piece.size();
+    return true;
+  }
+
   bool StructuredContent() {
     if (tool_only_) {
       const auto offset = pending_offset();
@@ -2220,7 +2261,7 @@ private:
       if (start != std::string::npos) {
         const auto prose =
             ContentBefore(raw_, offset, found, closers_, quotes_, tools_);
-        if (!prose.empty() && !emit_piece_(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false)) {
           return false;
         }
         emitted_content_bytes_ += prose.size();
@@ -2238,7 +2279,7 @@ private:
       if (ready) {
         const auto text = ContentBefore(raw_, offset, offset + ready, closers_,
                                         quotes_, tools_);
-        if (!text.empty() && !emit_piece_(text, false)) {
+        if (!text.empty() && !Emit(text, false)) {
           return false;
         }
         emitted_content_bytes_ += text.size();
@@ -2259,7 +2300,7 @@ private:
       }
     }
     auto text = std::exchange(pending_, {});
-    return text.empty() || emit_piece_(text, false);
+    return text.empty() || Emit(text, false);
   }
   enum class State : std::uint8_t {
     kInitial,
@@ -2283,6 +2324,7 @@ private:
   ToolCloserSet closers_;
   std::span<const tokenization::ChatTool> tools_;
   std::size_t emitted_content_bytes_{0};
+  std::size_t emitted_reasoning_bytes_{0};
   bool trim_reasoning_separator_{false};
 };
 
@@ -2689,7 +2731,8 @@ HttpResponse StreamingResponse(
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
                             markers, closers, quotes);
-              if (!filter.Finish(generated.hide_tool_markup, generated.text)) {
+              if (!filter.Finish(generated.hide_tool_markup, generated.text,
+                                 generated.reasoning_content)) {
                 return;
               }
               for (std::size_t index = 0; index < generated.tool_calls.size();
@@ -3004,7 +3047,8 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                 result.finish_reason ==
                                     TextGenerationBackend::FinishReason::kStop,
                                 markers, closers, quotes);
-      if (!filter.Finish(generated.hide_tool_markup, generated.text)) {
+      if (!filter.Finish(generated.hide_tool_markup, generated.text,
+                         generated.reasoning_content)) {
         generation->Cancel();
         return json::Value();
       }

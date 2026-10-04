@@ -124,14 +124,15 @@ Scrapes are not recorded as generation requests.
 
 Tool framing is removed when it directly echoes an accepted call or a client
 `<invoke name="X">` envelope names a declared tool. Other raw XML, standalone
-closers and spelled vocabulary tokens are literal content. A full call naming a
-declared tool inside an unfinished fence uses the legacy fallback only if its
-arguments satisfy the schema; completed fences and inline backticks remain
-documentation. Inline spans can cross nonblank lines and remain protected without
-a closing backtick; the unfinished-call fallback applies only to fences. These
-text-only rules cannot distinguish literal XML
-naming a declared tool from a failed envelope attempt, or an unfinished code
-example from a real call. Actual EOS handling uses token IDs in the backend.
+closers and spelled vocabulary tokens are literal content. A full Qwen call naming
+a declared tool inside an unfinished fence or inline backtick span uses the
+legacy fallback only if its arguments satisfy the schema. Completed fences and inline
+spans keep markers literal; inline spans can cross nonblank lines, but a closing
+backtick must arrive before the next blank line. Streaming holds a possible call
+inside an open span until the final parse resolves it. These text-only rules
+cannot distinguish literal XML naming a declared tool from a failed envelope
+attempt, or an unfinished code example from a real call. Actual EOS handling
+uses token IDs in the backend.
 
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh

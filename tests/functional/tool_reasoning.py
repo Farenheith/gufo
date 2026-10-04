@@ -651,6 +651,34 @@ def check_quoted_then_real_call(client, model, checks, chat_result):
             "prompt instead of reading it as a regression", checks)
 
 
+def check_unfinished_inline_then_call(client, model, checks, chat_result):
+    """A stray backtick followed by one newline must not swallow a real call."""
+    for name, prefix in (("filename", "I'll update `config.py"),
+                         ("apostrophe", "Let`s write it.")):
+        for streaming in (False, True):
+            mode = "stream" if streaming else "buffered"
+            label = f"unfinished_inline_then_call_{name}_{mode}"
+            request = dict(model=model, messages=[{"role": "system", "content":
+                "To call terminal, emit its native wire format:\n"
+                "<tool_call>\n<function=terminal>\n<parameter=command>\npwd\n"
+                "</parameter>\n</function>\n</tool_call>\n"
+                "The requested prose precedes this call."}, {"role": "user", "content":
+                "First write exactly this line, including its single stray backtick, "
+                "without closing it or adding another backtick:\n" + prefix +
+                "\nThen immediately on the next line, with exactly one newline and "
+                "no blank line between, call terminal with exactly the command pwd. "
+                "Do not write any other prose."}], tools=[terminal_tool("pwd")],
+                tool_choice="auto", reasoning_effort="none", temperature=0,
+                max_completion_tokens=256, extra_body={"cache_prompt": False})
+            result = chat_result(client, request, streaming)
+            checks[label] = result
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
+            assert_terminal_call(result, "pwd")
+            assert result["text"] == prefix + "\n", (
+                "the model must exercise the single-newline stray-backtick shape", result)
+            assert_no_envelope_framing(result)
+
+
 # A bracket-dense answer has no functional case: asked to repeat a literal line,
 # the model runs away into a repetition loop (1024 tokens, finish=length, ~47s)
 # instead of stopping, so the case reports a model runaway rather than a framing
@@ -729,3 +757,4 @@ def check_tool_reasoning(client, model, checks, chat_result):
     check_literal_protocol_data(client, model, checks, chat_result)
     check_html_content(client, model, checks, chat_result)
     check_quoted_then_real_call(client, model, checks, chat_result)
+    check_unfinished_inline_then_call(client, model, checks, chat_result)
