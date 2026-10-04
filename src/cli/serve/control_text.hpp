@@ -23,23 +23,25 @@ namespace gufo::server {
   // Track the block, not a toggle. A reply that spells the tags out — an
   // example inside its own reasoning, a nested block — keeps its outer block
   // open, because the example pairs with itself. A close outside reasoning is
-  // ignored rather than opening a block.
+  // ignored rather than opening a block. One scan per tag keeps the walk
+  // linear: the reply can be long, this runs whenever the model asks to stop.
   int depth = 0;
   std::size_t cursor = 0;
   while (cursor < text.size()) {
-    const auto open = text.find(kThinkStart, cursor);
-    const auto close = text.find(kThinkEnd, cursor);
-    if (close != std::string_view::npos &&
-        (open == std::string_view::npos || close < open)) {
-      depth = depth > 0 ? depth - 1 : 0;
-      cursor = close + kThinkEnd.size();
-      continue;
-    }
-    if (open == std::string_view::npos) {
+    const auto tag = text.find('<', cursor);
+    if (tag == std::string_view::npos) {
       break;
     }
-    ++depth;
-    cursor = open + kThinkStart.size();
+    const auto rest = text.substr(tag);
+    if (rest.starts_with(kThinkStart)) {
+      ++depth;
+      cursor = tag + kThinkStart.size();
+    } else if (rest.starts_with(kThinkEnd)) {
+      depth = depth > 0 ? depth - 1 : 0;
+      cursor = tag + kThinkEnd.size();
+    } else {
+      cursor = tag + 1;
+    }
   }
   return depth > 0;
 }
