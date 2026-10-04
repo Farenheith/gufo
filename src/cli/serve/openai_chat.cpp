@@ -21,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/cli/serve/quote_tracker.hpp"
 #include "src/cli/serve/response_format.hpp"
 #include "src/cli/serve/sampling_request.hpp"
@@ -79,16 +78,8 @@ ToolMarkerSet ToolMarkers(
                                       : ToolMarkerSet(qwen);
 }
 
-// Tags that close a call, per admitted dialect. Assistant content never ends
-// with the closing framing of a call: the model either consumed it in the call
-// the parser already took, or repeated it afterwards, and a client that stores
-// the repeat replays the markup as history on every later turn (#383).
-//
-// Recognizing an opener and recognizing its closer are one decision, so every
-// set below mirrors the markers of the grammar it belongs to. Two mirrors are
-// not the dialect's own: the client's envelope is framing under every grammar,
-// its blocks parsed whatever the request declared (#393, kEnvelopeHeads), and
-// the unconstrained fallback admits every opener, so it admits every closer.
+// Closers eligible for removal immediately after an accepted call. Standalone
+// closers and XML remain literal; the declared-tool envelope rule is separate.
 constexpr std::array<std::string_view, 4> kQwenClosers{
     "</parameter>",
     "</function>",
@@ -120,9 +111,6 @@ constexpr std::array<std::string_view, 9> kToolClosers{
     "</｜DSML｜tool_calls>",
 };
 using ToolCloserSet = std::span<const std::string_view>;
-
-// The reasoning phase boundary. A quote cannot span it, so the scanner restarts
-// there; one definition keeps that rule from drifting.
 
 ToolCloserSet ToolClosers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
@@ -1047,8 +1035,7 @@ std::size_t EarliestMarker(std::string_view full, ToolMarkerSet markers,
     // The cheap question first: only a position that carries a marker is worth
     // asking about quoting, which is what keeps a line full of '<' linear.
     for (const auto marker : markers) {
-      if (full.substr(next).starts_with(marker) &&
-          !quotes.QuotedAt(full, next)) {
+      if (full.substr(next).starts_with(marker) && !quotes.QuotedAt(next)) {
         return next;
       }
     }
@@ -1073,7 +1060,7 @@ std::size_t HeldMarkerPrefix(std::string_view full, std::size_t end,
                             [&](std::string_view marker) {
                               return marker.starts_with(suffix);
                             }) &&
-        !quotes.QuotedAt(full, end - length)) {
+        !quotes.QuotedAt(end - length)) {
       return length;
     }
   }
@@ -1085,45 +1072,13 @@ bool ToolMarkerPrefix(std::string_view text, ToolMarkerSet markers) {
       markers, [&](auto marker) { return marker.starts_with(text); });
 }
 
-// A pipe-wrapped vocabulary token: <|im_end|>, <|endoftext|>, <|tool_call|>.
-// Whether one is framing is a vocabulary question, not a spelling one: a model
-// can quote a lookalike as argument data, so only a spelling the tokenizer
-// Bytes of inter-tag filler at position end: whitespace, or a stray bar left
-// over from a full-width token the model broke apart.
-std::size_t FramingFillerLength(std::string_view text, std::size_t end) {
-  if (end == 0) {
-    return 0;
-  }
-  if (std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
-    return 1;
-  }
-  if (text[end - 1] == '|') {
-    return 1;
-  }
-  return 0;
-}
-
-// The client's envelope: the dialect a harness renders for the model, built
-// from bare `<invoke name="…">` and `<parameter name="…">` tags. No dialect
-// admits it as a call — the model's own dialects are `<tool_call>` and
-// `<｜DSML｜…>`, and those stay visible prose when foreign (#393) — so a block
-// written in the envelope is framing, and content must not carry the shape: a
-// client that stores it replays the markup as history on every later turn
-// (#383).
+// Client envelope syntax is removed only when it names a declared tool, or
+// immediately echoes a call the parser accepted. Other XML stays content.
 constexpr std::array<std::string_view, 1> kEnvelopeHeads{"<invoke name="};
 constexpr std::array<std::string_view, 1> kEnvelopeParameters{
     "<parameter name="};
 constexpr std::array<std::string_view, 2> kEnvelopeClosers{"</invoke>",
                                                            "</parameter>"};
-// The head and the parameter tags of every call block the server parses, in
-// every dialect. A run of admitted closers ends one of these blocks, and the
-// head that opened it goes with the closers: a head and a body with their end
-// removed is the same markup, half gone.
-constexpr std::array<std::string_view, 3> kBlockHeads{
-    "<invoke name=", "<function=", "<｜DSML｜invoke name="};
-constexpr std::array<std::string_view, 3> kBlockParameters{
-    "<parameter name=", "<parameter=", "<｜DSML｜parameter name="};
-
 // The last of `tags` at or before `stop`, or npos when there is none or the
 // last one sits in quoted prose.
 template<std::size_t N>
@@ -1148,49 +1103,43 @@ std::size_t LastUnquotedTag(std::string_view full, std::size_t stop,
       last = found;
     }
   }
-  if (last == std::string_view::npos || quotes.QuotedAt(full, floor + last)) {
+  if (last == std::string_view::npos || quotes.QuotedAt(floor + last)) {
     return std::string_view::npos;
   }
   return floor + last;
 }
 
-// Where the last call-shaped block at or before `stop` opens, or npos. The
-// head of a block carries the whole block, so the head decides where the block
-// stands: a cut that began at a parameter tag would leave the head behind.
-template<std::size_t H, std::size_t M>
-std::size_t LastBlockStart(std::string_view full, std::size_t stop,
-                           std::size_t floor,
-                           const std::array<std::string_view, H>& heads,
-                           const std::array<std::string_view, M>& members,
-                           QuoteTracker& quotes) {
-  if (const auto head = LastUnquotedTag(full, stop, floor, heads, quotes);
-      head != std::string_view::npos) {
-    return head;
-  }
-  // A parameter tag with no head above it is the same shape without the
-  // wrapper that held it.
-  return LastUnquotedTag(full, stop, floor, members, quotes);
+bool DeclaredEnvelope(std::string_view tag,
+                      std::span<const tokenization::ChatTool> tools) {
+  const auto value = tag.substr(kEnvelopeHeads.front().size());
+  if (value.empty() || (value.front() != '\"' && value.front() != '\''))
+    return false;
+  const auto end = value.find(value.front(), 1);
+  return end != std::string_view::npos &&
+         std::ranges::any_of(tools, [&](const auto& tool) {
+           return tool.name == value.substr(1, end - 1);
+         });
 }
 
-// Where the last block in the client's envelope opens, or npos.
-std::size_t LastEnvelopeOpener(std::string_view full, std::size_t stop,
-                               std::size_t floor, QuoteTracker& quotes) {
-  return LastBlockStart(full, stop, floor, kEnvelopeHeads, kEnvelopeParameters,
-                        quotes);
-}
-
-// Where a trailing envelope block opens within [floor, stop), or npos. The
-// block counts as closed when its own closers end the region, and as truncated
-// when it carries the parameter tag of a call and no closer at all: either
-// shape is a call, so the block is framing rather than prose. Prose that names
-// an opener outside quotes is not a shape, and one that quotes it stays prose
-// under the quoting question.
+// Find a closed or truncated client envelope whose request context identifies
+// a tool attempt. A bare parameter block is not enough evidence.
 std::size_t EnvelopeBlockStart(std::string_view full, std::size_t stop,
                                std::size_t floor, ToolCloserSet closers,
-                               QuoteTracker& quotes) {
-  const auto opening = LastEnvelopeOpener(full, stop, floor, quotes);
+                               std::span<const tokenization::ChatTool> tools,
+                               bool after_call, QuoteTracker& quotes) {
+  const auto opening =
+      LastUnquotedTag(full, stop, floor, kEnvelopeHeads, quotes);
   if (opening == std::string_view::npos) {
     return std::string_view::npos;
+  }
+  const auto tag_end = full.find('>', opening);
+  if (!after_call) {
+    if (tag_end == std::string_view::npos || tag_end >= stop) {
+      return std::string_view::npos;
+    }
+    if (!DeclaredEnvelope(full.substr(opening, tag_end - opening), tools)) {
+      return std::string_view::npos;
+    }
   }
   const auto region = TrimTrailing(full.substr(opening, stop - opening));
   for (const auto closer : kEnvelopeClosers) {
@@ -1209,142 +1158,76 @@ std::size_t EnvelopeBlockStart(std::string_view full, std::size_t stop,
   return opening;
 }
 
-// Where a trailing run of closing tags begins within [0, end), or npos when
-// the text does not end with one. Whitespace between the tags belongs to the
-// run. A run that starts inside quoted prose is not framing: the model is
-// naming the tags there, so the run is prose (#383).
-std::size_t TrailingFramingStart(std::string_view full, std::size_t end,
-                                 std::size_t floor, ToolCloserSet closers,
-                                 const ControlTokensTrie* control_tokens,
-                                 QuoteTracker& quotes) {
-  std::size_t position = end;
-  std::size_t start = std::string_view::npos;
-  // Where the run begins, never reaching back past the slice it is reported
-  // for. A run that starts before the slice covers the slice entirely.
-  const auto run_start = [&]() -> std::size_t {
-    if (start == std::string_view::npos) {
-      return std::string_view::npos;
-    }
-    const std::size_t run = std::min(start, position);
-    return run < floor ? floor : run;
-  };
-  // Length of the tag ending at `position`, or 0: an admitted closer, or a
-  // spelling the loaded vocabulary owns. Only those are framing: a lookalike
-  // the vocabulary does not list is data, wherever the response puts it (#383).
-  const auto tag_length = [&](std::size_t position) -> std::size_t {
-    for (const auto closer : closers) {
-      if (position >= closer.size() &&
-          full.compare(position - closer.size(), closer.size(), closer) == 0) {
-        return closer.size();
-      }
-    }
-    const std::size_t longest =
-        control_tokens ? control_tokens->LongestSpelling() : 0;
-    const std::size_t window =
-        std::min(position - std::min(position, floor), longest);
-    for (std::size_t length = 1; length <= window; ++length) {
-      const std::size_t index = position - length;
-      if (full[index] == '<' &&
-          control_tokens->MatchAt(full, index) == length) {
-        return length;
-      }
-    }
-    return 0;
-  };
-  while (true) {
-    while (const auto filler = FramingFillerLength(full, position)) {
-      position -= filler;
-    }
-    const std::size_t length = tag_length(position);
-    if (length == 0) {
-      return run_start();
-    }
-    const std::size_t index = position - length;
-    // A run never reaches back past its slice, and quoted tags are prose:
-    // either way the run ends here.
-    if (index < floor || quotes.QuotedAt(full, index)) {
-      return run_start();
-    }
-    position = index;
-    start = position;
-  }
-}
-
-// Assistant content never ends with the tags that bracket a call: the model
-// echoes them back after a call, and a client that stores them replays the
-// markup as history on every later turn (#383). The separator that introduced
-// the run goes with it; text without a run is returned untouched. Quoted tags
-// are prose and stay.
+// Remove framing only with request context: a closer echo directly after a
+// parsed call, or a client envelope naming a declared tool. Other XML is data.
 std::string_view ContentBefore(std::string_view full, std::size_t begin,
                                std::size_t end, ToolCloserSet closers,
-                               const ControlTokensTrie* control_tokens,
-                               QuoteTracker& quotes) {
-  const std::size_t stop = std::min(end, full.size());
-  if (stop <= begin) {
-    return std::string_view{};
-  }
-  std::string_view slice = full.substr(begin, stop - begin);
-  std::size_t start =
-      TrailingFramingStart(full, stop, begin, closers, control_tokens, quotes);
-  // The run closed a block: its head goes with its closers, whichever dialect
-  // wrote the block.
-  if (start != std::string_view::npos) {
-    if (const auto head = LastBlockStart(full, start, begin, kBlockHeads,
-                                         kBlockParameters, quotes);
-        head != std::string_view::npos) {
-      start = head;
+                               QuoteTracker& quotes,
+                               std::span<const tokenization::ChatTool> tools,
+                               bool after_call = false) {
+  const auto stop = std::min(end, full.size());
+  if (stop <= begin)
+    return {};
+  if (after_call) {
+    auto cursor = begin;
+    bool removed = false;
+    while (cursor < stop) {
+      while (cursor < stop &&
+             std::isspace(static_cast<unsigned char>(full[cursor])))
+        ++cursor;
+      const auto tag = std::ranges::find_if(closers, [&](auto closer) {
+        return full.substr(cursor, stop - cursor).starts_with(closer);
+      });
+      if (tag == closers.end() || quotes.QuotedAt(cursor))
+        break;
+      cursor += tag->size();
+      removed = true;
     }
+    if (removed)
+      begin = cursor;
   }
-  // A block in the client's envelope is framing even when nothing closed it.
-  if (const auto block = EnvelopeBlockStart(full, stop, begin, closers, quotes);
-      block != std::string_view::npos &&
-      (start == std::string_view::npos || block < start)) {
-    start = block;
+  const auto slice = full.substr(begin, stop - begin);
+  const bool adjacent_envelope =
+      after_call && Trim(slice).starts_with(kEnvelopeHeads.front());
+  if (const auto block = EnvelopeBlockStart(full, stop, begin, closers, tools,
+                                            adjacent_envelope, quotes);
+      block != std::string_view::npos) {
+    return TrimTrailing(full.substr(begin, block - begin));
   }
-  if (start == std::string_view::npos) {
-    return slice;
-  }
-  return TrimTrailing(full.substr(begin, start - begin));
+  return slice;
 }
 
-// How much of the tail of [0, end) is still undecided: a tag still being
-// written, or a run of closing tags that only becomes ordinary text once the
-// model writes prose after it. A run stays undecided across the split tag that
-// follows it.
+// Hold only a possible client envelope. A declared-tool head must stay pending
+// until final parsing decides whether it is quoted documentation or framing.
 std::size_t FramingHold(std::string_view full, std::size_t end,
                         std::size_t floor, ToolCloserSet closers,
-                        const ControlTokensTrie* control_tokens,
-                        QuoteTracker& quotes) {
+                        QuoteTracker& quotes,
+                        std::span<const tokenization::ChatTool> tools) {
   std::size_t hold = 0;
   if (end > 0) {
-    // An unfinished tag is a '<' with no '>' after it, and it is held whatever
-    // it might become: the tag is still arriving, so the vocabulary has no
-    // answer to give and the shape is not a call or prose yet. The hold
-    // resolves when the '>' arrives. The trie decides control tokens where a
-    // spelling is complete; a tag still being written is nobody's question.
+    // Hold only a suffix that can still become admitted framing. A bare
+    // comparison such as "3 < 5" is already prose once the space arrives.
     const auto open = full.find_last_of('<', end - 1);
     if (open != std::string_view::npos && open >= floor &&
-        full.find('>', open) >= end) {
-      hold = end - open;
+        !quotes.QuotedAt(open)) {
+      const auto suffix = full.substr(open, end - open);
+      const auto prefix = [&](auto tags) {
+        return std::ranges::any_of(
+            tags, [&](auto tag) { return tag.starts_with(suffix); });
+      };
+      if (prefix(kEnvelopeHeads)) {
+        hold = suffix.size();
+      }
     }
   }
-  for (std::size_t position = end - hold; position > floor;) {
-    const auto run = TrailingFramingStart(full, position, floor, closers,
-                                          control_tokens, quotes);
-    if (run == std::string_view::npos) {
-      break;
-    }
-    hold = end - run;
-    position = run;
-  }
-  // ContentBefore can remove a whole block when its admitted closers arrive.
-  // Hold the same opener set here, including native orphan parameters, so no
-  // part of that block has already streamed. Foreign blocks remain literal
-  // content when ContentBefore resolves the held tail; quoted blocks are prose.
-  if (const auto opening = LastBlockStart(full, end, floor, kBlockHeads,
-                                          kBlockParameters, quotes);
+  if (const auto opening =
+          LastUnquotedTag(full, end, floor, kEnvelopeHeads, quotes);
       opening != std::string_view::npos) {
-    hold = std::max(hold, end - opening);
+    const auto tag_end = full.find('>', opening);
+    if (tag_end == std::string_view::npos || tag_end >= end ||
+        DeclaredEnvelope(full.substr(opening, tag_end - opening), tools)) {
+      hold = std::max(hold, end - opening);
+    }
   }
   // The separator before framing is removed with it. Keep trailing whitespace
   // undecided until the next piece establishes whether it introduces prose or
@@ -1426,13 +1309,18 @@ bool SchemaAccepts(const json::Value& root, const json::Value& original,
 
 void ParseQwenCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
-    const std::shared_ptr<const ControlTokensTrie>& control_tokens_trie,
     std::vector<ParsedToolCall>* calls,
     std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr) {
   constexpr std::string_view start = "<tool_call>";
   constexpr std::string_view end = "</tool_call>";
+  QuoteTracker call_quotes;
+  call_quotes.Reset(text);
   std::size_t cursor = 0;
   while ((cursor = text.find(start, cursor)) != std::string_view::npos) {
+    if (call_quotes.QuotedAt(cursor)) {
+      cursor += start.size();
+      continue;
+    }
     const auto marker_begin = cursor;
     const auto begin = cursor + start.size();
     cursor = begin;  // A malformed call may be followed by a valid call.
@@ -1474,10 +1362,8 @@ void ParseQwenCalls(
         }
         const std::string name(Trim(body.substr(0, name_end)));
         body.remove_prefix(name_end + 1);
-        // Outer closing tags inside a parameter are data, not structure. A
-        // vocabulary control token is not: the model's envelope ended there, so
-        // the closer cannot be recovered and the value must not absorb the
-        // framing that follows it (#383). A lookalike spelling is data.
+        // Decoded characters are argument data, including vocabulary token
+        // spellings. Actual EOS IDs are handled by the backend before parsing.
         auto close = body.find("</parameter>");
         const bool framed_value =
             body.starts_with('\n') || body.starts_with("\r\n");
@@ -1489,20 +1375,6 @@ void ParseQwenCalls(
                        ? text.size()
                        : static_cast<std::size_t>(body.data() - text.data()) +
                              close + std::string_view{"</parameter>"}.size();
-        }
-        if (close != std::string_view::npos) {
-          // Only a spelling the vocabulary owns can have ended the envelope; a
-          // lookalike is argument data and must survive. The scan stops at the
-          // closer, which is all this decision depends on.
-          if (control_tokens_trie != nullptr &&
-              control_tokens_trie->FindFirst(body, close) !=
-                  std::string_view::npos) {
-            valid = false;
-            if (framed_value) {
-              cursor = text.size();
-            }
-            break;
-          }
         }
         if (close == std::string_view::npos || name.empty()) {
           valid = false;
@@ -1600,6 +1472,26 @@ void ParseQwenCalls(
         std::ranges::none_of(
             tools, [&](const auto& tool) { return tool.name == call.name; }))
       complete = false;
+    if (complete && call_quotes.UnclosedAt(marker_begin)) {
+      // An unfinished fence is ambiguous. Restore the legacy fallback only for
+      // a declared call whose complete arguments satisfy its schema.
+      const auto tool =
+          std::ranges::find(tools, call.name, &tokenization::ChatTool::name);
+      if (tool == tools.end()) {
+        complete = false;
+      } else {
+        try {
+          const auto grammar = sampling::JsonConstraint::Compile(
+              json::parse(tool->parameters_json), false);
+          auto state = grammar->Start();
+          for (const unsigned char byte : ArgumentsJson(call.arguments))
+            state = grammar->Advance(state, byte);
+          complete = grammar->Complete(state);
+        } catch (const std::exception&) {
+          complete = false;
+        }
+      }
+    }
     if (complete) {
       call.id = RandomId("call_");
       calls->push_back(std::move(call));
@@ -1755,15 +1647,16 @@ ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
     std::span<const tokenization::ChatTool> tools,
-    const std::shared_ptr<const ControlTokensTrie>& control_tokens_trie,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes) {
+  quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
   const bool recognize_tools =
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone;
   const auto tool_marker = [recognize_tools, markers,
                             &quotes](std::string_view text) {
+    quotes.Reset(text);
     return recognize_tools ? EarliestMarker(text, markers, quotes)
                            : std::string_view::npos;
   };
@@ -1841,6 +1734,7 @@ ParsedGeneration ParseGeneration(
     }
   }
 
+  quotes.Reset(parsed.text);
   const std::size_t marker = EarliestMarker(parsed.text, markers, quotes);
   if (choice != ChatRequest::ToolChoice::kNone && !tools.empty() &&
       marker != std::string_view::npos) {
@@ -1850,8 +1744,7 @@ ParsedGeneration ParseGeneration(
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
     if (text_from_tools.starts_with("<tool_call>"))
-      ParseQwenCalls(text_from_tools, tools, control_tokens_trie,
-                     &parsed.tool_calls);
+      ParseQwenCalls(text_from_tools, tools, &parsed.tool_calls);
     else
       ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
     std::erase_if(parsed.tool_calls, [&](const auto& call) {
@@ -1861,18 +1754,17 @@ ParsedGeneration ParseGeneration(
     // An explicit stop can interrupt a call before its closing tags. Keep
     // complete calls, but do not expose an unfinished call as ordinary text.
     if (!parsed.tool_calls.empty() || !enforce_required) {
-      parsed.text = std::string(
-          ContentBefore(text_before_tools, 0, text_before_tools.size(), closers,
-                        control_tokens_trie.get(), quotes));
+      parsed.text = std::string(ContentBefore(text_before_tools, 0,
+                                              text_before_tools.size(), closers,
+                                              quotes, tools));
       parsed.hide_tool_markup = true;
     }
   } else if (recognize_tools) {
     // No marker: the text is content, but the framing it carries still goes.
     // The streamed response drops it as the turn ends, and both transports
     // must report the same content.
-    parsed.text =
-        std::string(ContentBefore(parsed.text, 0, parsed.text.size(), closers,
-                                  control_tokens_trie.get(), quotes));
+    parsed.text = std::string(ContentBefore(parsed.text, 0, parsed.text.size(),
+                                            closers, quotes, tools));
   }
   if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
       parsed.tool_calls.empty())
@@ -1884,7 +1776,6 @@ ParsedGeneration ParseGeneration(
 ParsedGeneration ParseStructuredGeneration(
     std::string_view raw, TextGenerationBackend::InitialOutputState initial,
     std::span<const tokenization::ChatTool> tools,
-    const std::shared_ptr<const ControlTokensTrie>& control_tokens_trie,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes) {
   ParsedGeneration parsed;
@@ -1900,14 +1791,14 @@ ParsedGeneration ParseStructuredGeneration(
     raw.remove_prefix(end + 8);
   }
   const auto content = tool_only ? raw : Trim(raw);
+  quotes.Reset(content);
   if (const auto marker = EarliestMarker(content, markers, quotes);
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
       (tool_only || marker == 0) && marker != std::string_view::npos &&
       !content.substr(marker).starts_with("<tool_call>")) {
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
-        control_tokens_trie, choice, enforce_required, markers, closers,
-        quotes);
+        choice, enforce_required, markers, closers, quotes);
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -1926,13 +1817,13 @@ ParsedGeneration ParseStructuredGeneration(
        ToolMarkerPrefix(content, markers))) {
     ParsedGeneration call;
     std::vector<std::pair<std::size_t, std::size_t>> spans;
-    ParseQwenCalls(content, tools, control_tokens_trie, &call.tool_calls,
+    ParseQwenCalls(content, tools, &call.tool_calls,
                    tool_only ? &spans : nullptr);
     if (tool_only) {
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
-        call.text += ContentBefore(content, cursor, begin, closers,
-                                   control_tokens_trie.get(), quotes);
+        call.text += ContentBefore(content, cursor, begin, closers, quotes,
+                                   tools, cursor > 0);
         cursor = end;
       }
       const auto tail = content.substr(cursor);
@@ -1952,8 +1843,14 @@ ParsedGeneration ParseStructuredGeneration(
                                    : std::min(cursor + limit, content.size());
       // The model repeats the framing of the call it just made; that echo is
       // markup, not prose the client should replay on the next turn (#383).
-      call.text += ContentBefore(content, cursor, stop, closers,
-                                 control_tokens_trie.get(), quotes);
+      call.text += ContentBefore(content, cursor, stop, closers, quotes, tools,
+                                 cursor > 0);
+    }
+    if (call.tool_calls.empty() && marker != std::string_view::npos &&
+        quotes.UnclosedAt(marker) &&
+        choice != ChatRequest::ToolChoice::kRequired) {
+      parsed.text = std::string(raw);
+      return parsed;
     }
     call.hide_tool_markup = true;
     if (call.tool_calls.empty() && enforce_required &&
@@ -1971,10 +1868,9 @@ ParsedGeneration ParseStructuredGeneration(
   // A constrained turn that produced no call is still reported without
   // framing: the streamed response drops it as the turn ends, and both
   // transports must report the same content.
-  parsed.text =
-      tool_only ? std::string(ContentBefore(raw, 0, raw.size(), closers,
-                                            control_tokens_trie.get(), quotes))
-                : std::string(raw);
+  parsed.text = tool_only ? std::string(ContentBefore(raw, 0, raw.size(),
+                                                      closers, quotes, tools))
+                          : std::string(raw);
   return parsed;
 }
 
@@ -2113,14 +2009,14 @@ public:
       TextGenerationBackend::InitialOutputState initial_output_state,
       EmitCallback emit_piece, bool structured, bool tool_only,
       bool recognize_tools, ToolMarkerSet markers, ToolCloserSet closers,
-      const ControlTokensTrie* control_tokens)
+      std::span<const tokenization::ChatTool> tools)
       : emit_piece_(std::move(emit_piece)),
         raw_content_(structured || tool_only),
         tool_only_(tool_only),
         recognize_tools_(recognize_tools),
         markers_(markers),
         closers_(closers),
-        control_tokens_trie_(control_tokens) {
+        tools_(tools) {
     if (initial_output_state ==
         TextGenerationBackend::InitialOutputState::kReasoning) {
       state_ = State::kThinking;
@@ -2133,6 +2029,7 @@ public:
   bool Push(std::string_view bytes, bool final = false) {
     const auto piece = decoder_.Push(bytes, final);
     raw_.append(piece);
+    quotes_.Append(piece);
     if (tool_mode_) {
       hidden_.append(piece);
       return true;
@@ -2232,10 +2129,10 @@ public:
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker != std::string::npos) {
-        const auto prose = recognize_tools_
-                               ? ContentBefore(raw_, offset, found, closers_,
-                                               control_tokens_trie_, quotes_)
-                               : std::string_view(pending_).substr(0, marker);
+        const auto prose =
+            recognize_tools_
+                ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
+                : std::string_view(pending_).substr(0, marker);
         if (!prose.empty() && !emit_piece_(prose, false)) {
           return false;
         }
@@ -2247,12 +2144,11 @@ public:
 
       const std::size_t held =
           recognize_tools_
-              ? std::min(
-                    std::max(
-                        HeldMarkerPrefix(raw_, raw_.size(), markers_, quotes_),
-                        FramingHold(raw_, raw_.size(), offset, closers_,
-                                    control_tokens_trie_, quotes_)),
-                    pending_.size())
+              ? std::min(std::max(HeldMarkerPrefix(raw_, raw_.size(), markers_,
+                                                   quotes_),
+                                  FramingHold(raw_, raw_.size(), offset,
+                                              closers_, quotes_, tools_)),
+                         pending_.size())
               : 0;
       const std::size_t ready = pending_.size() - held;
       if (ready > 0 && !emit_piece_(pending_.substr(0, ready), false)) {
@@ -2282,11 +2178,10 @@ public:
         // With tools declared, the closing tags the model repeats after a call
         // are markup; a client must never store them as assistant prose (#383).
         const auto offset = pending_offset();
-        const auto text =
-            recognize_tools_ && state_ == State::kContent
-                ? ContentBefore(raw_, offset, raw_.size(), closers_,
-                                control_tokens_trie_, quotes_)
-                : std::string_view(pending_);
+        const auto text = recognize_tools_ && state_ == State::kContent
+                              ? ContentBefore(raw_, offset, raw_.size(),
+                                              closers_, quotes_, tools_)
+                              : std::string_view(pending_);
         const bool is_reasoning = (state_ == State::kThinking);
         const bool emitted = emit_piece_(text, is_reasoning);
         pending_.clear();
@@ -2318,8 +2213,8 @@ private:
       const auto start =
           found == std::string::npos ? std::string::npos : found - offset;
       if (start != std::string::npos) {
-        const auto prose = ContentBefore(raw_, offset, found, closers_,
-                                         control_tokens_trie_, quotes_);
+        const auto prose =
+            ContentBefore(raw_, offset, found, closers_, quotes_, tools_);
         if (!prose.empty() && !emit_piece_(prose, false)) {
           return false;
         }
@@ -2331,13 +2226,13 @@ private:
       }
       const auto held = std::min(
           std::max(HeldMarkerPrefix(raw_, raw_.size(), markers_, quotes_),
-                   FramingHold(raw_, raw_.size(), offset, closers_,
-                               control_tokens_trie_, quotes_)),
+                   FramingHold(raw_, raw_.size(), offset, closers_, quotes_,
+                               tools_)),
           pending_.size());
       const auto ready = pending_.size() - held;
       if (ready) {
         const auto text = ContentBefore(raw_, offset, offset + ready, closers_,
-                                        control_tokens_trie_, quotes_);
+                                        quotes_, tools_);
         if (!text.empty() && !emit_piece_(text, false)) {
           return false;
         }
@@ -2381,7 +2276,7 @@ private:
   ToolMarkerSet markers_;
   QuoteTracker quotes_;
   ToolCloserSet closers_;
-  const ControlTokensTrie* control_tokens_trie_{nullptr};
+  std::span<const tokenization::ChatTool> tools_;
   std::size_t emitted_content_bytes_{0};
   bool trim_reasoning_separator_{false};
 };
@@ -2630,19 +2525,18 @@ HttpResponse NonStreamingResponse(
   const auto closers = ToolClosers(format);
   core::Utf8Decoder decoder;
   const auto decoded = decoder.Push(result.text, true);
-  const auto control_tokens_trie = backend.control_tokens_trie();
   QuoteTracker quotes;
   const ParsedGeneration generated =
       request.chat.response_format || request.chat.constrained_tools
           ? ParseStructuredGeneration(
                 decoded, initial_output_state, request.chat.tools,
-                control_tokens_trie, request.chat.tool_choice,
+                request.chat.tool_choice,
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
                 markers, closers, quotes)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
-                            control_tokens_trie, request.chat.tool_choice,
+                            request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
                             markers, closers, quotes);
@@ -2701,7 +2595,6 @@ HttpResponse StreamingResponse(
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
-  const auto control_tokens_trie = backend.control_tokens_trie();
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   return {
       .status = 200,
@@ -2715,7 +2608,7 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state, markers, closers, control_tokens_trie,
+           initial_output_state, markers, closers,
            stream_log](const HttpResponse::BodyWriter& writer) {
             json::Value role_delta = json::Value::object();
             role_delta["role"] = "assistant";
@@ -2747,7 +2640,7 @@ HttpResponse StreamingResponse(
                 request.chat.constrained_tools && !request.chat.response_format,
                 !request.chat.tools.empty() &&
                     request.chat.tool_choice != ChatRequest::ToolChoice::kNone,
-                markers, closers, control_tokens_trie.get());
+                markers, closers, request.chat.tools);
 
             TextGenerationBackend::ProgressCallback on_progress;
             if (request.chat.return_progress) {
@@ -2779,8 +2672,7 @@ HttpResponse StreamingResponse(
                   request.chat.response_format || request.chat.constrained_tools
                       ? ParseStructuredGeneration(
                             filter.raw(), initial_output_state,
-                            request.chat.tools, control_tokens_trie,
-                            request.chat.tool_choice,
+                            request.chat.tools, request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
                             request.chat.constrained_tools &&
@@ -2788,8 +2680,7 @@ HttpResponse StreamingResponse(
                             markers, closers, quotes)
                       : ParseGeneration(
                             filter.raw(), initial_output_state,
-                            request.chat.tools, control_tokens_trie,
-                            request.chat.tool_choice,
+                            request.chat.tools, request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
                             markers, closers, quotes);
@@ -3021,9 +2912,8 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
 GeneratedText SplitGeneratedText(
     std::string_view text, TextGenerationBackend::InitialOutputState initial) {
   QuoteTracker quotes;
-  auto generated =
-      ParseGeneration(text, initial, {}, {}, ChatRequest::ToolChoice::kNone,
-                      false, {}, {}, quotes);
+  auto generated = ParseGeneration(
+      text, initial, {}, ChatRequest::ToolChoice::kNone, false, {}, {}, quotes);
   return {.reasoning = std::move(generated.reasoning_content),
           .text = std::move(generated.text)};
 }
@@ -3040,11 +2930,10 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
-  const auto control_tokens_trie = backend.control_tokens_trie();
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers,
-                    control_tokens_trie, model = backend.model_id(), stream_log,
+                    model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     ResponsesOutput output(model, writer, chat);
     if (!output.Begin()) {
@@ -3064,7 +2953,7 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
         chat.constrained_tools && !chat.response_format,
         !chat.tools.empty() &&
             chat.tool_choice != ChatRequest::ToolChoice::kNone,
-        markers, closers, control_tokens_trie.get());
+        markers, closers, chat.tools);
     try {
       TextGenerationBackend::ProgressCallback on_progress;
       if (writer && chat.return_progress) {
@@ -3100,14 +2989,13 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       const auto generated =
           chat.response_format || chat.constrained_tools
               ? ParseStructuredGeneration(
-                    filter.raw(), initial, chat.tools, control_tokens_trie,
-                    chat.tool_choice,
+                    filter.raw(), initial, chat.tools, chat.tool_choice,
                     result.finish_reason ==
                         TextGenerationBackend::FinishReason::kStop,
                     chat.constrained_tools && !chat.response_format, markers,
                     closers, quotes)
               : ParseGeneration(filter.raw(), initial, chat.tools,
-                                control_tokens_trie, chat.tool_choice,
+                                chat.tool_choice,
                                 result.finish_reason ==
                                     TextGenerationBackend::FinishReason::kStop,
                                 markers, closers, quotes);

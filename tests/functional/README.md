@@ -122,9 +122,20 @@ in-flight KV ratio. Concurrent shared-prefix requests also check that parked
 followers reserve slots and keep newer arrivals queued within `--sessions`.
 Scrapes are not recorded as generation requests.
 
+Tool framing is removed when it directly echoes an accepted call or a client
+`<invoke name="X">` envelope names a declared tool. Other raw XML, standalone
+closers and spelled vocabulary tokens are literal content. A full call naming a
+declared tool inside an unfinished fence uses the legacy fallback only if its
+arguments satisfy the schema; completed fences and balanced inline backticks
+remain documentation. These text-only rules cannot distinguish literal XML
+naming a declared tool from a failed envelope attempt, or an unfinished code
+example from a real call. Actual EOS handling uses token IDs in the backend.
+
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
-`--output` directory.
+`--output` directory. Repeat `--case` to select affected tasks;
+`--case literal-protocol --passes 1` exercises a real write/read/verify loop
+containing literal ChatML vocabulary spellings.
 It replays #368's five tasks, verifies the generated code independently, and
 retains Pi sessions, HTTP/SSE and per-request timings. It executes generated
 commands in disposable fixtures using isolated Pi configuration. Use `--passes 1`

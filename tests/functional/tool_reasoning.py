@@ -107,7 +107,7 @@ ENVELOPE_CASES = {
         "Write this line on its own, exactly as it appears here, then a blank line, "
         "then call the terminal tool to print the working directory:\n</invoke>"
     ),
-    # The closer alone, with nothing else on the wire.
+    # Without an accepted call, a closer alone is literal content.
     "closer_alone": (
         "Write this line on its own, exactly as it appears here, then stop:\n</invoke>"
     ),
@@ -126,6 +126,9 @@ ENVELOPE_CASES = {
     # framing the parser consumed.
     "closer_in_arguments": (
         "Call terminal with exactly this command: printf '%s' '</invoke>'"
+    ),
+    "vocab_token_in_arguments": (
+        "Call terminal with exactly this command: printf '%s' 'EOS = \"<|im_end|>\"'"
     ),
     "lookalike_in_arguments": (
         "Call terminal with exactly this command: printf '%s' '<|not_a_vocab_entry|>'"
@@ -352,6 +355,7 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
     """A closing tag of the client's envelope never reaches visible text."""
     commands = {"closer_before_call": "pwd", "framing_between_calls": "pwd",
                 "closer_in_arguments": "printf '%s' '</invoke>'",
+                "vocab_token_in_arguments": "printf '%s' 'EOS = \"<|im_end|>\"'",
                 "lookalike_in_arguments": "printf '%s' '<|not_a_vocab_entry|>'"}
     for name, prompt in ENVELOPE_CASES.items():
         # A shape may override the documented call format: the model can only
@@ -385,7 +389,10 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
                 checks[label + "_date"] = following
                 print(f"CHECK {label}_date", file=sys.stderr, flush=True)
                 assert_terminal_call(following, "date")
-                assert_no_envelope_framing(following)
+                assert "</invoke>" in following["text"], ("a closer before a call stays literal", following)
+            if name in ("closer_alone", "closer_before_call", "framing_between_calls"):
+                assert "</invoke>" in text, ("a closer without an earlier accepted call stays literal", result)
+                continue
             if name == "closer_quoted":
                 assert "```" in text and '<invoke name="terminal"' in text, result
                 assert "</invoke>" in text, ("quoted markup must survive as prose", result)
@@ -496,6 +503,28 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
         assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > 0, (
             "replayed history did not reuse its warm prefix", result)
 
+
+
+def check_literal_protocol_data(client, model, checks, chat_result):
+    """Vocabulary spellings and undeclared XML remain literal with tools enabled."""
+    literals = {
+        "raw_xml": '<invoke name="documentation"><parameter name="value">x</parameter></invoke>',
+        "token_word": 'EOS = "<|im_end|>"',
+        "comparison": "3 < 5 and x < y.",
+    }
+    for name, literal in literals.items():
+        for streaming in (False, True):
+            label = f"literal_protocol_{name}_{'stream' if streaming else 'buffered'}"
+            request = dict(model=model, messages=[{"role": "user", "content":
+                "Reply with exactly the following literal text, without any code fence, "
+                "explanation or tool call:\n" + literal}], tools=[terminal_tool()],
+                tool_choice="auto", reasoning_effort="none", temperature=0,
+                max_completion_tokens=128, extra_body={"cache_prompt": False})
+            result = chat_result(client, request, streaming)
+            checks[label] = result
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
+            assert result["text"].strip() == literal, ("literal text was changed or erased", result)
+            assert not result["tools"] and result["finish"] == "stop", result
 
 
 def check_html_content(client, model, checks, chat_result):
@@ -697,5 +726,6 @@ def check_tool_reasoning(client, model, checks, chat_result):
     check_envelope_closer_framing(client, model, checks, chat_result)
     check_tail_lookalike_content(client, model, checks, chat_result)
     check_unfinished_lookalike(client, model, checks, chat_result)
+    check_literal_protocol_data(client, model, checks, chat_result)
     check_html_content(client, model, checks, chat_result)
     check_quoted_then_real_call(client, model, checks, chat_result)

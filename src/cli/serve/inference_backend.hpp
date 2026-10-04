@@ -10,7 +10,6 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
@@ -126,8 +125,6 @@ public:
   [[nodiscard]] std::uint32_t max_context() const override;
   [[nodiscard]] std::vector<SessionState> session_states() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
-  [[nodiscard]] std::shared_ptr<const ControlTokensTrie> control_tokens_trie()
-      const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);

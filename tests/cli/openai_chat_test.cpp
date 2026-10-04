@@ -14,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 
@@ -74,13 +73,6 @@ private:
   const std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format_;
 };
 
-/// A trie over the spellings a test wants the parser to recognise.
-std::shared_ptr<const gufo::server::ControlTokensTrie> MakeControlTokensTrie(
-    std::initializer_list<std::string> spellings) {
-  return std::make_shared<const gufo::server::ControlTokensTrie>(
-      std::vector<std::string>(spellings));
-}
-
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
@@ -90,12 +82,6 @@ public:
   }
   [[nodiscard]] gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning_defaults_value;
-  }
-  /// The control-token vocabulary the parser consults. Null by default: a
-  /// pipe-wrapped spelling is argument data unless a test declares it here.
-  [[nodiscard]] std::shared_ptr<const gufo::server::ControlTokensTrie>
-  control_tokens_trie() const override {
-    return control_tokens_trie_;
   }
   [[nodiscard]] InitialOutputState initial_output_state(
       const gufo::server::ChatRequest& request) const override {
@@ -207,7 +193,6 @@ public:
 
   std::vector<std::string> pieces;
   std::vector<PromptProgress> progress;
-  std::shared_ptr<const gufo::server::ControlTokensTrie> control_tokens_trie_;
   std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format;
   std::string cache_miss_reason;
   FinishReason finish_reason{FinishReason::kStop};
@@ -324,6 +309,51 @@ void TestStreamingIsLive() {
              response.stream_log->details.find("finish=length") !=
                  std::string::npos,
          "Streaming completion retains request diagnostics");
+}
+
+void TestLessThanProseStreamsBeforeCompletion() {
+  FakeBackend backend;
+  backend.pieces = {"3 < 5 and x < y", " are comparisons."};
+  backend.block_after_first_piece = true;
+  auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model","messages":[{"role":"user","content":"explain"}],
+    "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+    "stream":true,"reasoning_effort":"none"
+  })"),
+                                                 backend);
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::string content;
+  std::jthread writer([&] {
+    response.streaming_body([&](std::string_view part) {
+      if (part == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(part.substr(6));
+      {
+        const std::lock_guard lock(mutex);
+        for (const auto& choice : event.find("choices")->items()) {
+          if (const auto* delta = choice.find("delta"))
+            content += delta->member_str("content");
+        }
+      }
+      ready.notify_all();
+      return true;
+    });
+  });
+  Expect(backend.WaitForFirstPiece(), "backend reaches the comparison prose");
+  bool arrived;
+  {
+    std::unique_lock lock(mutex);
+    arrived =
+        ready.wait_for(lock, 2s, [&] { return content == backend.pieces[0]; });
+  }
+  const auto completed = backend.completed.load();
+  backend.Release();
+  writer.join();
+  Expect(arrived && !completed,
+         "all comparison prose streams while generation is still blocked");
+  Expect(content == "3 < 5 and x < y are comparisons.",
+         "comparison content stays exact");
 }
 
 void TestCachePromptOption() {
@@ -875,8 +905,6 @@ void TestQwenToolBoundariesAndSchema() {
         body["chat_template_kwargs"] = Value::object();
         body["chat_template_kwargs"]["enable_thinking"] = reasoning;
         FakeBackend backend;
-        backend.control_tokens_trie_ =
-            MakeControlTokensTrie({"<|im_end|>", "<|endoftext|>"});
         const auto text =
             (reasoning ? "Considering. </think>" : "") + item.text;
         // Split every marker and argument across token callbacks.
@@ -3295,264 +3323,143 @@ void TestToolClosingFraming() {
     "model":"test-model", "messages":[{"role":"user","content":"use f"}],
     "tools":[{"type":"function","function":{"name":"f","parameters":{
       "type":"object","properties":{"text":{"type":"string"}},
-      "required":["text"]}}}]
+      "required":["text"],"additionalProperties":false}}}]
   })");
   const std::string call =
-      "<tool_call>\n<function=f>\n<parameter=text>\n42\n</parameter>\n"
-      "</function>\n</tool_call>";
-  const std::string prose = "Found the sessions. Let me peek at one.";
-  // Verbatim tails captured from gufo responses in #383.
-  const std::string echo = "\n\n\t\t</invoke>\n</parameter>\n</function>\n";
-  const std::string pitchfork = "`" + std::string(32, ']') + "<|tool_call|>{";
-  // The turn that reopened #383 from a live client (session row 106141): a
-  // line of prose, then a call written in the client's envelope, then the
-  // model's own call — the only one that ran. The engine consumed the
-  // envelope's closers before the client saw the text, which is how a head
-  // and a body arrived with no end: the halves of this exact block.
-  const std::string live_prose =
-      "Recovering the pieces this needs — llama-swap profiles (without "
-      "dumping anything sensitive), what's loaded now, and whether the two "
-      "branches can merge cleanly:";
-  const std::string live_block = R"call(<invoke name="terminal">
-<parameter name="command">echo "=== what's loaded right now ==="
-curl -s localhost:8080/state 2>/dev/null | head -c 250; echo
-curl -s localhost:8080/engines 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print([ {k:v.get('model','?') if isinstance(v,dict) else v for k,v in (e.items() if isinstance(e,dict) else [])} for e in (d if isinstance(d,list) else [d]) ])" 2>/dev/null || curl -s localhost:8080/engines | head -c 250
-echo "=== can the two branches merge cleanly? (no worktree change) ==="
-cd ~/projects/personal/gufo
-git merge-tree --write-tree --name-only pr-299-qwen35moe fix/tool-closing-framing > /tmp/mergetree.txt 2>&1; echo "merge-tree exit=$? (0=clean, 1=conflicts)"
-head -12 /tmp/mergetree.txt)call";
+      "<tool_call><function=f><parameter=text>\n42\n</parameter></function></"
+      "tool_call>";
+  const std::string inline_call =
+      "<tool_call><function=f><parameter=text>42</parameter></function></"
+      "tool_call>";
+  const std::string envelope =
+      "<invoke name=\"f\"><parameter name=\"text\">x</parameter></invoke>";
+  const std::string raw_xml =
+      "<invoke name=\"documentation\"><parameter "
+      "name=\"text\">x</parameter></invoke>";
   struct Case {
     std::string text;
     std::size_t calls;
     std::string argument;
     std::string content;
-    std::optional<gufo::sampling::JsonConstraint::ToolFormat> format{};
-    // Whether content must carry no closing framing at all. The client's
-    // envelope is never a call, so a block written in it leaves whole.
-    bool framing_free{true};
   };
-  for (
-      const auto& item :
-      {Case{call + echo + "<|im_end|>", 1, R"({"text":"42"})", ""},
-       // Closing framing ahead of the next call is markup, not prose.
-       Case{prose + "\n\n</function_results>" + echo + call, 1,
-            R"({"text":"42"})", prose},
-       Case{call + "\n</function>\n<|tool_call|>\n" + call, 2,
+  for (const auto& item : std::vector<Case>{
+           {call + "\n</invoke>\n</parameter>\n</function>\n", 1,
             R"({"text":"42"})", ""},
-       // Native orphan parameters are framing too, even without a named call.
-       // The opener must stay held while its closing tags are still arriving.
-       Case{"Planning fixture.\n<parameter=text>\nSYNTHETIC_COMMAND\n"
-            "</parameter>\n</function>\n</tool_call>\n",
-            0, "", "Planning fixture.",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       Case{"Planning fixture.\n<function=f>\n<parameter=text>\n"
-            "SYNTHETIC_COMMAND\n</parameter>\n</function>\n",
-            0, "", "Planning fixture.",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       Case{"Native syntax:\n```xml\n<parameter=text>\nSYNTHETIC_COMMAND\n"
-            "</parameter>\n</function>\n</tool_call>\n```",
+           {call + "\n</function>\n" + call, 2, R"({"text":"42"})", ""},
+           {call + "\n" + envelope, 1, R"({"text":"42"})", ""},
+           {call + "\n</invoke>\n<|im_end|>", 1, R"({"text":"42"})",
+            "<|im_end|>"},
+           {"</invoke>\n" + call, 1, R"({"text":"42"})", "</invoke>\n"},
+           {"</invoke>", 0, "", "</invoke>"},
+           {"Text </parameter>", 0, "", "Text </parameter>"},
+           {"The token is <|im_end|>", 0, "", "The token is <|im_end|>"},
+           {"<parameter>x</parameter>", 0, "", "<parameter>x</parameter>"},
+           {raw_xml, 0, "", raw_xml},
+           {"Raw XML: " + raw_xml, 0, "", "Raw XML: " + raw_xml},
+           {envelope, 0, "", ""},
+           {"Planning.\n" + envelope, 0, "", "Planning."},
+           {"<invoke name=\"f\"><parameter name=\"text\">x", 0, "", ""},
+           {"Planning.\n<parameter=text>\nx\n</parameter>\n</function>\n</"
+            "tool_call>",
             0, "",
-            "Native syntax:\n```xml\n<parameter=text>\nSYNTHETIC_COMMAND\n"
-            "</parameter>\n</function>\n</tool_call>\n```",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen, false},
-       Case{
-           "<tool_call><function=f><parameter=text>\n<parameter=command>"
-           "SYNTHETIC_COMMAND</parameter></function></tool_call>"
-           "\n</parameter></function></tool_call>",
-           1,
-           R"({"text":"<parameter=command>SYNTHETIC_COMMAND</parameter></function></tool_call>"})",
-           "", gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // A dropped parameter closer must not fold the envelope that follows it
-       // into the value the client executes.
-       Case{"<tool_call><function=f><parameter=text>df -h /home<|im_end|>==="
-            "</parameter></function></tool_call>",
-            0, "", ""},
-       Case{"<tool_call>\n<function=f>\n<parameter=text>\nls -l /home\n"
-            "<|endoftext|>\n</parameter>\n</function>\n</tool_call>",
-            0, "", ""},
-       Case{"<tool_call><function=f><parameter=text>head -5 "
-            "notes.txt<|im_end|>" +
-                pitchfork + "</parameter></function></tool_call>",
-            0, "", ""},
-       // A nested call quoted inside a newline-framed value is still data.
-       Case{"<tool_call>\n<function=f>\n<parameter=text>\n<tool_call></"
-            "tool_call>"
-            "\n</parameter>\n</function>\n</tool_call>",
-            1, R"({"text":"<tool_call></tool_call>"})", ""},
-       // The client's envelope is framing under every admitted grammar: the
-       // block leaves whole, its head and body with its closers, so no half
-       // block reaches content or the history built from it.
-       Case{"<invoke name=\"f\">\n<parameter name=\"text\">leakme"
-            "</parameter>\n</invoke>\n"
-            "<tool_call><function=f><parameter=text>hello</parameter>"
-            "</function></tool_call>",
-            1, R"({"text":"hello"})", "",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // Alone the block is framing all the same: nothing was called, and the
-       // shape of a call may not become the client's prose either.
-       Case{"<invoke name=\"f\">\n<parameter name=\"text\">leakme"
-            "</parameter>\n</invoke>",
-            0, "", "", gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // The same block where no dialect was admitted: the unconstrained path
-       // the live request took.
-       Case{"<invoke name=\"f\">\n<parameter name=\"text\">leakme"
-            "</parameter>\n</invoke>",
-            0, "", ""},
-       // The captured live shape, verbatim (session row 103263): the model
-       // opens the client's envelope, is cut off before any closer, then
-       // writes a complete call of its own. A block left open is still the
-       // shape of a call, so it leaves with the call the parser took.
-       Case{"<invoke name=\"terminal\">\n<parameter name=\"command\">cd ~/pro"
-            "jects/personal/gufo && gh issue view 383 --json title,state,body"
-            ",labels,comments --jq '{title, state, labels: [.labels[].name], "
-            "comments: [.comments[] | {author: .author.login, body: .body}]}'"
-            " 2>&1 | head -120\n"
-            "<tool_call><function=f><parameter=text>hello</parameter>"
-            "</function></tool_call>",
-            1, R"({"text":"hello"})", "",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // Prose before the block survives; the block leaves.
-       Case{"Found the gufo sessions. Let me peek at the session structure,"
-            " then extract a summary from each.\n\n<invoke name=\"f\">\n"
-            "<parameter name=\"text\">leakme</parameter>\n</invoke>",
+            "Planning.\n<parameter=text>\nx\n</parameter>\n</function>\n</"
+            "tool_call>"},
+           {"<function=f><parameter=text>x</parameter></function>", 0, "",
+            "<function=f><parameter=text>x</parameter></function>"},
+           {"```xml\n" + envelope + "\n```", 0, "",
+            "```xml\n" + envelope + "\n```"},
+           {"`" + envelope + "` and prose", 0, "",
+            "`" + envelope + "` and prose"},
+           {"```python\nprint(1)\n" + call, 1, R"({"text":"42"})",
+            "```python\nprint(1)\n"},
+           {"```xml\n" + call + "\n```", 0, "", "```xml\n" + call + "\n```"},
+           {"```xml\n" + call + "\n```\n" + call, 1, R"({"text":"42"})",
+            "```xml\n" + call + "\n```\n"},
+           {"`" + inline_call + "`", 0, "", "`" + inline_call + "`"},
+           {"``" + inline_call + "``", 0, "", "``" + inline_call + "``"},
+           {"```xml\n<tool_call><function=unknown></function></tool_call>", 0,
+            "", "```xml\n<tool_call><function=unknown></function></tool_call>"},
+           {"```xml\n<tool_call><function=f></function></tool_call>", 0, "",
+            "```xml\n<tool_call><function=f></function></tool_call>"},
+           {"```xml\n<tool_call><function=f><parameter=extra>x</parameter></"
+            "function></tool_call>",
             0, "",
-            "Found the gufo sessions. Let me peek at the session structure, "
-            "then extract a summary from each.",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // The live turn itself, with the closers the model wrote: the block
-       // leaves whole, and only the model's own call is executed.
-       Case{live_prose + "\n\n\n" + live_block + "</parameter>\n</invoke>\n" +
-                call,
-            1, R"({"text":"42"})", live_prose,
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // The same turn under the default closer set, which is the one the live
-       // request admitted: the envelope is framing there too.
-       Case{live_prose + "\n\n\n" + live_block + "</parameter>\n</invoke>\n" +
-                call,
-            1, R"({"text":"42"})", live_prose},
-       // Cut off inside the block, with no call of its own: both transports
-       // report the same content, because the attempt is the shape of a call.
-       Case{live_prose + "\n\n\n" + live_block, 0, "", live_prose},
-       // Session row 106561, verbatim: the model closed a block the parser had
-       // already taken and then wrote the call that ran. The closer arrived
-       // with no head, so a run that only looked for the admitted dialect's
-       // closers left it behind: the same markup, half gone.
-       Case{"Unload endpoint works body-style (200). Now check which profiles "
-            "use bin_gufo (filtered grep, no secrets).\n\n\n</invoke>" +
-                call,
-            1, R"({"text":"42"})",
-            "Unload endpoint works body-style (200). Now check which profiles "
-            "use bin_gufo (filtered grep, no secrets).",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       // The same shape with nothing else on the wire. The client's envelope
-       // is framing in every dialect the server admits, closed or not, so a
-       // fragment of it is not prose under any of them.
-       Case{"\n\n</invoke>", 0, "", "",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
-       Case{"\n\n</invoke>", 0, "", "",
-            gufo::sampling::JsonConstraint::ToolFormat::kDeepSeek},
-       Case{"\n\n</parameter>", 0, "", "",
-            gufo::sampling::JsonConstraint::ToolFormat::kDeepSeek},
-       Case{"\n\n</invoke>", 0, "", ""},
-       // The DSML spelling is the model's own dialect, not the client's
-       // envelope: #393 keeps foreign native syntax visible, and this change
-       // holds that boundary, block closed or left open.
-       Case{"<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"text\">x"
-            "</｜DSML｜parameter>\n</｜DSML｜invoke>",
-            0, "",
-            "<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"text\">x"
-            "</｜DSML｜parameter>\n</｜DSML｜invoke>",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen, false},
-       Case{"<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"text\">x",
-            0, "",
-            "<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"text\">x",
-            gufo::sampling::JsonConstraint::ToolFormat::kQwen, false},
-       // Quoted, the same tags are prose the client keeps, top to bottom.
-       Case{"Here is how the client spells a call:\n\n```\n<invoke name=\"f\">"
-            "\n<parameter name=\"text\">x</parameter>\n</invoke>\n```",
-            0, "",
-            "Here is how the client spells a call:\n\n```\n<invoke name=\"f\">"
-            "\n<parameter name=\"text\">x</parameter>\n</invoke>\n```",
-            std::nullopt, false},
-       // A client-dialect block quoted inside an argument is data: the call
-       // that contains it is consumed whole and never re-scanned.
-       Case{
-           "<tool_call><function=f><parameter=text>\n<invoke name=\"f\">"
-           "<parameter name=\"text\">x</parameter></invoke>"
-           "\n</parameter></function></tool_call>",
-           1,
-           R"({"text":"<invoke name=\"f\"><parameter name=\"text\">x</parameter></invoke>"})",
-           ""}}) {
+            "```xml\n<tool_call><function=f><parameter=extra>x</parameter></"
+            "function></tool_call>"},
+           {"<tool_call><function=f><parameter=text>\nEOS = "
+            "\"<|im_end|>\"\n</parameter></function></tool_call>",
+            1, R"({"text":"EOS = \"<|im_end|>\""})", ""},
+           {"<tool_call><function=f><parameter=text>\n<|im_start|><|endoftext|>"
+            "<|not_a_vocab_entry|>\n</parameter></function></tool_call>",
+            1, R"({"text":"<|im_start|><|endoftext|><|not_a_vocab_entry|>"})",
+            ""},
+           {"<tool_call><function=f><parameter=text>\n</invoke>\n</parameter></"
+            "function></tool_call>",
+            1, R"({"text":"</invoke>"})", ""},
+       }) {
     for (bool stream : {false, true}) {
-      auto body = schema;
-      body["stream"] = stream;
-      body["tool_choice"] = "auto";
-      FakeBackend backend;
-      backend.tool_format = item.format;
-      // The pipe tokens these cases spell are real control tokens; declaring
-      // them keeps the framing rejection's intent explicit. A model that spells
-      // a lookalike is not naming one of these.
-      backend.control_tokens_trie_ = MakeControlTokensTrie(
-          {"<|im_end|>", "<|endoftext|>", "<|tool_call|>"});
-      for (char byte : item.text)
-        backend.pieces.emplace_back(1, byte);
-      const auto response =
-          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
-      Expect(response.status == 200, "closing framing request succeeds");
-      std::vector<Value> calls;
-      std::string content;
-      if (!stream) {
-        const auto output = gufo::json::parse(response.body);
-        const auto& message =
-            *output.find("choices")->items()[0].find("message");
-        if (const auto* text = message.find("content");
-            text && text->is_string())
-          content = text->get_str();
-        if (const auto* found = message.find("tool_calls"))
-          calls.assign(found->items().begin(), found->items().end());
-      } else {
-        std::string output;
-        response.streaming_body([&](std::string_view part) {
-          output += part;
-          return true;
-        });
-        std::size_t cursor = 0;
-        while ((cursor = output.find("data: ", cursor)) != std::string::npos) {
-          const auto begin = cursor + 6;
-          cursor = output.find('\n', begin);
-          const auto payload = output.substr(begin, cursor - begin);
-          if (payload == "[DONE]")
-            break;
-          const auto event = gufo::json::parse(payload);
-          const auto* choices = event.find("choices");
-          if (!choices || choices->empty())
-            continue;
-          const auto* delta = choices->items()[0].find("delta");
-          if (!delta)
-            continue;
-          content += delta->member_str("content");
-          if (const auto* found = delta->find("tool_calls"))
-            calls.insert(calls.end(), found->items().begin(),
-                         found->items().end());
+      for (bool bytewise : {false, true}) {
+        auto body = schema;
+        body["stream"] = stream;
+        body["tool_choice"] = "auto";
+        FakeBackend backend;
+        backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+        if (bytewise)
+          for (const char byte : item.text)
+            backend.pieces.emplace_back(1, byte);
+        else
+          backend.pieces.push_back(item.text);
+        const auto response =
+            gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        Expect(response.status == 200, "framing request succeeds");
+        std::vector<Value> calls;
+        std::string content;
+        std::string finish;
+        if (!stream) {
+          const auto output = gufo::json::parse(response.body);
+          const auto& choice = output.find("choices")->items()[0];
+          const auto& message = *choice.find("message");
+          content = message.member_str("content");
+          finish = choice.member_str("finish_reason");
+          if (const auto* found = message.find("tool_calls"))
+            calls.assign(found->items().begin(), found->items().end());
+        } else {
+          response.streaming_body([&](std::string_view part) {
+            if (part == "data: [DONE]\n\n")
+              return true;
+            const auto event = gufo::json::parse(part.substr(6));
+            for (const auto& choice : event.find("choices")->items()) {
+              finish += choice.member_str("finish_reason");
+              if (const auto* delta = choice.find("delta")) {
+                content += delta->member_str("content");
+                if (const auto* found = delta->find("tool_calls"))
+                  calls.insert(calls.end(), found->items().begin(),
+                               found->items().end());
+              }
+            }
+            return true;
+          });
         }
+        if (calls.size() != item.calls || content != item.content) {
+          std::cerr << "Framing input: " << item.text << "\nstream=" << stream
+                    << " bytewise=" << bytewise
+                    << "\nExpected content: " << item.content
+                    << "\nActual content: " << content
+                    << "\nExpected calls: " << item.calls
+                    << ", actual: " << calls.size() << '\n';
+        }
+        Expect(calls.size() == item.calls,
+               "only complete declared calls are emitted");
+        Expect(content == item.content,
+               "literal content and framing are distinguished using request "
+               "context");
+        Expect(finish == (item.calls ? "tool_calls" : "stop"),
+               "finish reason agrees with parsed calls");
+        if (!calls.empty())
+          Expect(calls.back().find("function")->member_str("arguments") ==
+                     item.argument,
+                 "literal arguments survive exactly");
       }
-      if (calls.size() != item.calls || content != item.content)
-        std::cerr << "Framing input: " << item.text << "\nstream: " << stream
-                  << "\nExpected calls: " << item.calls
-                  << ", actual: " << calls.size()
-                  << "\nExpected content: " << item.content
-                  << "\nActual content: " << content << '\n';
-      Expect(calls.size() == item.calls, "only complete calls are emitted");
-      Expect(content == item.content,
-             "response content carries no tool framing");
-      if (item.framing_free)
-        Expect(content.find("</") == std::string::npos &&
-                   content.find("<|") == std::string::npos,
-               "closing framing never reaches assistant content");
-      if (!calls.empty())
-        Expect(calls.back().find("function")->member_str("arguments") ==
-                   item.argument,
-               "argument values terminate at the model's own closer");
     }
   }
 }
@@ -3660,47 +3567,6 @@ void TestProseAboutTheDialectIsNotACall() {
   }
 }
 
-void TestControlTokensTrie() {
-  const gufo::server::ControlTokensTrie trie(std::vector<std::string>(
-      {"<|im_end|>", "<|endoftext|>", "<|tool_call|>", "<|im_start|>"}));
-  Expect(trie.FindFirst("<|im_end|>") == 0, "a spelling matches at its start");
-  Expect(trie.FindFirst("say <|im_end|> now") == 4,
-         "a spelling matches inside text");
-  Expect(trie.FindFirst("<|not_a_vocab_entry|>") == std::string_view::npos,
-         "a lookalike is not a spelling");
-  Expect(trie.FindFirst("<|im|>") == std::string_view::npos,
-         "a partial spelling is not a spelling");
-  Expect(trie.FindFirst("<|im_start|>") == 0,
-         "a shared prefix does not end a longer spelling early");
-  // No spelling carries '<', so a failed walk can only resume at the root and
-  // the next '<' starts a fresh candidate.
-  Expect(trie.FindFirst("<|<|im_end|>") == 2,
-         "a failed walk restarts at the root");
-  Expect(trie.FindFirst("<|im_end|>", 0) == std::string_view::npos,
-         "a limit of zero excludes a spelling starting at it");
-  Expect(trie.FindFirst("x<|im_end|>y", 1) == std::string_view::npos,
-         "the limit excludes a spelling that starts at it");
-  Expect(trie.FindFirst("x<|im_end|>y", 2) == 1,
-         "a spelling starting before the limit matches");
-  Expect(gufo::server::ControlTokensTrie().FindFirst("<|im_end|>") ==
-             std::string_view::npos,
-         "an empty trie matches nothing");
-
-  // A vocabulary also lists spellings that are not control tokens in model
-  // output. Only the pipe-wrapped shape may end an envelope; matching an
-  // envelope tag would discard an argument that legitimately contains it.
-  const gufo::server::ControlTokensTrie mixed(std::vector<std::string>(
-      {"<tool_call>", "</tool_call>", "<function=", "<|im_end|>"}));
-  Expect(mixed.FindFirst("x<|im_end|>") == 1,
-         "a pipe-wrapped spelling is indexed");
-  Expect(mixed.FindFirst("<tool_call>") == std::string_view::npos,
-         "an envelope tag is not a control token spelling");
-  Expect(mixed.FindFirst("</tool_call>") == std::string_view::npos,
-         "a closing envelope tag is not a control token spelling");
-  Expect(mixed.FindFirst("<function=") == std::string_view::npos,
-         "a call tag without bars is not a control token spelling");
-}
-
 /// A bracket-dense line, in units that never split across pieces.
 std::string AngleUnits(std::size_t units) {
   std::string text;
@@ -3785,6 +3651,7 @@ int main() {
   TestCachePromptOption();
   TestToolChoiceEnforcement();
   TestStreamingIsLive();
+  TestLessThanProseStreamsBeforeCompletion();
   TestStreamingWithoutUsage();
   TestUtf8Output();
   TestCachedPrefillMetrics();
@@ -3806,7 +3673,6 @@ int main() {
   TestToolNameCharacters();
   TestMalformedHistoricalFunctions();
   TestToolClosingFraming();
-  TestControlTokensTrie();
   TestProseAboutTheDialectIsNotACall();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();

@@ -21,7 +21,6 @@
 #include <type_traits>
 #include <utility>
 
-#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -47,7 +46,7 @@ namespace gufo::server {
 
 // A selected token ends the turn only when the request admits EOS and the token
 // is one of the model's stop tokens. The engine stops there itself and the stop
-// is reported through ResolveDecodedRun, so this stays per-request state.
+// is reported by the engine, so this stays per-request state.
 template<typename State, typename Tokens>
 bool EndsTurn(const State& state, const Tokens& tokens, int token) {
   return state.stop_at_eos() && tokens.IsStopToken(token);
@@ -941,26 +940,10 @@ private:
   void* probe_buffer_{};
 };
 
-// The tokenizer's control tokens, held in a trie once per model load so every
-// request shares one immutable structure and none of them copies it (#383).
-std::shared_ptr<const ControlTokensTrie> BuildControlTokensTrie(
-    const tokenization::QwenTokenizer& tokenizer) {
-  std::vector<std::string> spellings;
-  spellings.reserve(tokenizer.SpecialTokens().size());
-  for (const auto& entry : tokenizer.SpecialTokens()) {
-    spellings.push_back(entry.first);
-  }
-  return std::make_shared<const ControlTokensTrie>(spellings);
-}
-
 class QwenTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
-  }
-  [[nodiscard]] std::shared_ptr<const ControlTokensTrie> control_tokens_trie()
-      const override {
-    return control_tokens_trie_;
   }
   QwenTextRunner(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
@@ -973,7 +956,6 @@ public:
         max_context_(max_context),
         speculative_options_(speculative_options),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
-    control_tokens_trie_ = BuildControlTokensTrie(model_->GetTokenizer());
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -1584,7 +1566,6 @@ private:
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
-  std::shared_ptr<const ControlTokensTrie> control_tokens_trie_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -2492,10 +2473,6 @@ public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
-  [[nodiscard]] std::shared_ptr<const ControlTokensTrie> control_tokens_trie()
-      const override {
-    return control_tokens_trie_;
-  }
   QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
@@ -2505,7 +2482,6 @@ public:
         max_context_(max_context),
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens) {
-    control_tokens_trie_ = BuildControlTokensTrie(model_->tokenizer());
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2668,23 +2644,20 @@ public:
     };
   }
 
-  // Adapter from a decoded MTP step to the shared rule: build the run, let the
-  // state resolve it per token. When the request admits EOS, the engine stops
-  // there too: the ending token is accounted for, never rendered, and the
-  // reported history stays exactly as long as the session's.
-  void ResolveStepTokens(QwenFlashNextTextRunnerState& qfn, bool engine_stopped,
+  // The engine stops before committing EOS when the request enables it.
+  // Every returned token is committed work and is emitted exactly once.
+  void ResolveStepTokens(QwenFlashNextTextRunnerState&, bool engine_stopped,
                          std::span<const std::int32_t> tokens,
                          TextDecodeStep* step) const {
-    std::vector<TextRunnerState::DecodedToken> run;
-    run.reserve(tokens.size());
+    step->stop = engine_stopped;
+    step->selections.reserve(tokens.size());
     for (const std::int32_t token : tokens) {
-      run.push_back({
+      step->selections.push_back({
+          .stop = false,
           .token = static_cast<TextRunnerToken>(token),
           .piece = model_->TokenText(token),
-          .stops = EndsTurn(qfn, *model_, token),
       });
     }
-    step->stop = qfn.ResolveDecodedRun(run, engine_stopped, &step->selections);
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
@@ -2749,7 +2722,7 @@ public:
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
     // Use the same request policy as SelectNext and the batched MTP path.
-    // ResolveStepTokens accounts for an executed EOS without decoding past it.
+    // The engine stops before committing EOS or work beyond it.
     if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
                                   qfn.stop_at_eos())) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
@@ -2965,7 +2938,6 @@ private:
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
-  std::shared_ptr<const ControlTokensTrie> control_tokens_trie_;
 };
 #endif
 
@@ -3665,21 +3637,6 @@ ReasoningOptions InferenceBackend::reasoning_defaults() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr ? state->reasoning_defaults : ReasoningOptions{};
-#else
-  return {};
-#endif
-}
-
-std::shared_ptr<const ControlTokensTrie> InferenceBackend::control_tokens_trie()
-    const {
-#if defined(ENGINE_ENABLE_HIP)
-  const auto state = impl_->Snapshot();
-  if (state == nullptr) {
-    return {};
-  }
-  // Shared ownership: a request keeps the trie alive even if the runner that
-  // built it is released while the response is still being assembled.
-  return state->scheduler->runner().control_tokens_trie();
 #else
   return {};
 #endif
