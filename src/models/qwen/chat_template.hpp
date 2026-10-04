@@ -53,6 +53,9 @@ struct ChatMessage {
 
   ChatRole role{ChatRole::kUser};
   std::string content;
+  /// Internal server-authored instructions following system/developer content.
+  /// These bytes are template framing, never supplied by the HTTP message API.
+  std::string framing_suffix;
   std::string name;     ///< Optional function/tool name
   std::string thought;  ///< Optional thinking/reasoning prefix
   std::string tool_call_id;

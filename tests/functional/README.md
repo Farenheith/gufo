@@ -138,6 +138,15 @@ cannot distinguish literal XML naming a declared tool from a failed envelope
 attempt, or an unfinished code example from a real call. Actual EOS handling
 uses token IDs in the backend.
 
+Server-authored JSON tool and response-format instructions are template framing;
+client message content remains literal text, including spelled tool delimiters.
+With tools declared, trailing whitespace can be held until the next decoded
+piece, so a streamed delta ending in whitespace may arrive one token later.
+Cancellation fixtures that stop after a fixed number of deltas can therefore
+replay different assistant text from main. Compare those timings using matched
+interrupted histories, not a direct baseline for the divergent session; this
+also applies to later disk-spacing and cancellation requests in that history.
+
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
 `--output` directory. Repeat `--case` to select affected tasks;

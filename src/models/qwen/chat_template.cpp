@@ -365,8 +365,8 @@ std::optional<std::string> QwenChatTemplate::Render(
 
   std::size_t estimated_len = 0;
   for (const auto& msg : messages) {
-    estimated_len +=
-        msg.content.size() + msg.thought.size() + 32 + msg.images.size() * 64;
+    estimated_len += msg.content.size() + msg.framing_suffix.size() +
+                     msg.thought.size() + 32 + msg.images.size() * 64;
     std::size_t previous = 0;
     for (const auto& image : msg.images) {
       if (msg.role != ChatRole::kUser || image.bytes == nullptr ||
@@ -410,14 +410,24 @@ std::optional<std::string> QwenChatTemplate::Render(
 
   std::size_t message_index = 0;
   std::string system_content;
+  std::vector<ContentSpan> system_content_spans;
   while (message_index < messages.size() &&
          (messages[message_index].role == ChatRole::kSystem ||
           messages[message_index].role == ChatRole::kDeveloper)) {
-    const auto content = Trim(messages[message_index].content);
+    const auto& message = messages[message_index];
+    const std::string untrimmed = message.content + message.framing_suffix;
+    const auto content = Trim(untrimmed);
     if (!content.empty()) {
       if (!system_content.empty())
         system_content.push_back('\n');
-      system_content.append(content);
+      const auto begin =
+          static_cast<std::size_t>(content.data() - untrimmed.data());
+      const auto client_end =
+          std::min(message.content.size(), begin + content.size());
+      const auto client_size = client_end > begin ? client_end - begin : 0;
+      AppendContent(system_content, &system_content_spans,
+                    content.substr(0, client_size));
+      system_content.append(content.substr(client_size));
     }
     ++message_index;
   }
@@ -429,7 +439,10 @@ std::optional<std::string> QwenChatTemplate::Render(
   if (!system_prefix.empty() && !system_content.empty()) {
     system_prefix.append("\n\n");
   }
-  AppendContent(system_prefix, &system_spans, system_content);
+  const auto system_content_offset = system_prefix.size();
+  system_prefix.append(system_content);
+  for (const auto& span : system_content_spans)
+    system_spans.push_back({system_content_offset + span.offset, span.size});
   if (!system_prefix.empty()) {
     output.append("<|im_start|>system\n");
     const auto prefix_offset = output.size();
