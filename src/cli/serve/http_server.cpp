@@ -139,14 +139,25 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-bool SendChunk(int fd, std::string_view data) {
+bool SendChunk(int fd, std::string_view data, std::string_view prefix = {}) {
   if (data.empty())
-    return true;
+    return prefix.empty() || SendAll(fd, prefix);
   char header[2 * sizeof(std::size_t) + 2];
   const auto length =
       std::to_chars(header, header + sizeof(header) - 2, data.size(), 16);
   *length.ptr = '\r';
   *(length.ptr + 1) = '\n';
+  if (!prefix.empty()) {
+    // Deferred headers and the first event travel in one send, avoiding a
+    // separate small packet before the client can start parsing the stream.
+    std::string first;
+    first.reserve(prefix.size() + data.size() + sizeof(header) + 2);
+    first.append(prefix);
+    first.append(header, length.ptr + 2);
+    first.append(data);
+    first.append("\r\n");
+    return SendAll(fd, first);
+  }
   return SendAll(fd, std::string_view(header, length.ptr + 2 - header)) &&
          SendAll(fd, data) && SendAll(fd, "\r\n");
 }
@@ -817,6 +828,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
             [generation = std::move(generation), id, created, model,
              include_usage, return_progress,
              stream_log](const HttpResponse::BodyWriter& writer) {
+              bool started = return_progress;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -846,6 +858,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       chunk["timings"] = *timings;
                     if (progress != nullptr)
                       chunk["prompt_progress"] = *progress;
+                    started = true;
                     return writer("data: " + chunk.dump() + "\n\n");
                   };
               core::Utf8Decoder decoder;
@@ -867,7 +880,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       connected = write_chunk(text, {});
                       return connected;
                     },
-                    on_progress);
+                    on_progress,
+                    [&] {
+                      // Admitted or long-queued: later failures are SSE.
+                      started = true;
+                      connected = writer({});
+                      return connected;
+                    });
                 stream_log->details = GenerationLogDetails(result);
                 RecordServerMetrics(result);
                 if (!connected || result.cancelled)
@@ -889,6 +908,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                 }
                 (void)writer("data: [DONE]\n\n");
               } catch (const TextGenerationError& error) {
+                if (!started)
+                  throw;
                 stream_log->error_code = error.stable_code();
                 json::Value detail = json::Value::object();
                 detail["message"] = error.what();
@@ -900,9 +921,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     writer("data: " + event.dump() + "\n\n");
                 (void)writer("data: [DONE]\n\n");
               } catch (const std::exception& error) {
-                // The client gets a stable code instead of internals, but the
-                // cause has to survive somewhere: an error code with no reason
-                // in the log cannot be diagnosed after the fact.
+                if (!started)
+                  throw;
+                // Retain the cause in logs alongside the client's stable code.
                 Logger::Error("chat", error.what());
                 stream_log->error_code = "generation_failed";
                 json::Value detail = json::Value::object();
@@ -919,6 +940,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
             },
         .stream_log = std::move(stream_log),
+        .defer_stream_headers = !return_progress,
     };
   }
 
@@ -1255,6 +1277,10 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
+  out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
+      << "# TYPE gufo_device_lost_total counter\n"
+      << "gufo_device_lost_total "
+      << detail::DeviceLostTotal().load(std::memory_order_relaxed) << "\n";
   out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed, "
          "excluding cache hits\n"
       << "# TYPE llamacpp:prompt_tokens_total counter\n"
@@ -1899,8 +1925,10 @@ void HttpServer::handle_connection(int client_fd) {
       if (chunked)
         resp.headers.emplace_back("Transfer-Encoding", "chunked");
       const auto head = BuildResponseHead(resp, std::nullopt);
-      response_started = true;
-      connected = SendAll(client_fd, head);
+      if (!resp.defer_stream_headers) {
+        response_started = true;
+        connected = SendAll(client_fd, head);
+      }
       if (connected) {
         std::mutex write_mutex;
         std::condition_variable_any write_cv;
@@ -1909,8 +1937,15 @@ void HttpServer::handle_connection(int client_fd) {
           const std::lock_guard lock(write_mutex);
           if (!connected)
             return false;
-          connected =
-              chunked ? SendChunk(client_fd, chunk) : SendAll(client_fd, chunk);
+          if (!response_started) {
+            response_started = true;
+            connected = chunked ? SendChunk(client_fd, chunk, head)
+                                : SendAll(client_fd, head + std::string(chunk));
+            write_cv.notify_all();
+          } else {
+            connected = chunked ? SendChunk(client_fd, chunk)
+                                : SendAll(client_fd, chunk);
+          }
           if (connected && !chunk.empty()) {
             last_write = std::chrono::steady_clock::now();
           }
@@ -1921,6 +1956,8 @@ void HttpServer::handle_connection(int client_fd) {
             options_.sse_heartbeat_interval.count() > 0) {
           heartbeat = std::jthread([&](std::stop_token stop) {
             std::unique_lock lock(write_mutex);
+            write_cv.wait(lock, stop,
+                          [&] { return response_started || !connected; });
             while (!stop.stop_requested() && connected) {
               const auto deadline =
                   last_write + options_.sse_heartbeat_interval;
@@ -1947,7 +1984,7 @@ void HttpServer::handle_connection(int client_fd) {
           heartbeat.join();
         // An SSE error is a complete protocol response. A failed raw PCM
         // stream must remain incomplete, or it looks like valid shorter audio.
-        if (connected && chunked &&
+        if (connected && response_started && chunked &&
             (!resp.stream_log || resp.stream_log->error_code.empty() ||
              resp.stream_log->error_event_sent))
           connected = SendAll(client_fd, "0\r\n\r\n");
@@ -2006,7 +2043,8 @@ void HttpServer::handle_connection(int client_fd) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
-    HttpResponse resp = Err(500, "Internal Server Error", e.what(),
+    HttpResponse resp = Err(500, "Internal Server Error",
+                            *e.what() ? e.what() : "generation failed",
                             "internal_error", "server_exception");
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     Logger::LogRequest(req.request_id, req.method, req.path,

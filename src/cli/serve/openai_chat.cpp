@@ -65,8 +65,11 @@ ToolMarkerSet ToolMarkers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
   using Format = sampling::JsonConstraint::ToolFormat;
   static constexpr std::array<std::string_view, 1> qwen{"<tool_call>"};
-  static constexpr std::array<std::string_view, 1> deepseek{
-      "<｜DSML｜tool_calls>"};
+  // The template writes "\n\n" before the call block. As in llama.cpp
+  // common/parsers/deepseek.cpp (TC_SEPARATOR + FC_START), that separator is
+  // framing: returning it as content would double it when history is replayed.
+  static constexpr std::array<std::string_view, 2> deepseek{
+      "\n\n<｜DSML｜tool_calls>", "<｜DSML｜tool_calls>"};
   // The JSON fallback has no native counterpart in llama.cpp. Its grammar
   // leaves text before <tool_call> unconstrained, where models still write
   // their native call syntax; keep recognizing every opener there.
@@ -311,10 +314,13 @@ bool ParseArguments(std::string_view arguments,
     *error = "tool arguments must encode a JSON object";
     return false;
   }
+  // Render typed values as the reference chat templates' tojson does (and as
+  // llama.cpp's Jinja runtime does), so a replayed call matches the tokens
+  // the model generated and its continuation checkpoint is reused.
   for (const auto& [name, value] : parsed.members()) {
     out->push_back({
         .name = name,
-        .value = value.is_string() ? value.get_str() : value.dump(),
+        .value = value.is_string() ? value.get_str() : value.tojson(),
         .is_string = value.is_string(),
     });
   }
@@ -1035,8 +1041,11 @@ std::size_t EarliestMarker(std::string_view full, ToolMarkerSet markers,
     // The cheap question first: only a position that carries a marker is worth
     // asking about quoting, which is what keeps a line full of '<' linear.
     for (const auto marker : markers) {
-      if (full.substr(next).starts_with(marker) && !quotes.QuotedAt(next)) {
-        return next;
+      const auto tag_offset = marker.find('<');
+      if (tag_offset != std::string_view::npos && next - from >= tag_offset &&
+          full.substr(next - tag_offset).starts_with(marker) &&
+          !quotes.QuotedAt(next)) {
+        return next - tag_offset;
       }
     }
     position = next + 1;
@@ -1398,9 +1407,19 @@ void ParseQwenCalls(
             SchemaAccepts(*schema, *property, json::Value(std::string(value)));
         // Prefer text if the schema permits it; parsing ambiguous scalars
         // as JSON would silently change a caller's declared string type.
-        const bool is_string = string_allowed;
+        // A union also admitting other types tries those first, as
+        // llama.cpp's qwen3-coder parser does.
+        std::optional<json::Value> typed;
+        if (string_allowed && property &&
+            ResolveToolSchema(*schema, *property)) {
+          typed = TryParseJson(Trim(value));
+          if (!typed || typed->is_string() ||
+              !SchemaAccepts(*schema, *property, *typed))
+            typed.reset();
+        }
+        const bool is_string = string_allowed && !typed;
         std::string raw(is_string ? value : Trim(value));
-        if (!is_string) {
+        if (!is_string && !typed) {
           auto parsed = TryParseJson(raw);
           if (!parsed || !SchemaAccepts(*schema, *property, *parsed)) {
             raw = PythonLiteralsToJson(raw);
@@ -2657,15 +2676,22 @@ HttpResponse StreamingResponse(
           [request, generation = std::move(generation), id, created, model,
            initial_output_state, markers, closers,
            stream_log](const HttpResponse::BodyWriter& writer) {
-            json::Value role_delta = json::Value::object();
-            role_delta["role"] = "assistant";
-            if (!writer(Sse(
-                    ChoiceChunk(id, created, model, std::move(role_delta))))) {
+            bool connected = true;
+            bool started = false;
+            const auto begin = [&] {
+              if (!started) {
+                started = true;
+                json::Value role_delta = json::Value::object();
+                role_delta["role"] = "assistant";
+                connected = writer(Sse(
+                    ChoiceChunk(id, created, model, std::move(role_delta))));
+              }
+              return connected;
+            };
+            if (request.chat.return_progress && !begin()) {
               generation->Cancel();
               return;
             }
-
-            bool connected = true;
             QuoteTracker quotes;
             StreamingTextFilter filter(
                 initial_output_state,
@@ -2696,7 +2722,7 @@ HttpResponse StreamingResponse(
                     auto chunk =
                         ChoiceChunk(id, created, model, json::Value::object());
                     chunk["prompt_progress"] = PromptProgressJson(progress);
-                    connected = connected && writer(Sse(chunk));
+                    connected = begin() && writer(Sse(chunk));
                     return connected;
                   };
             }
@@ -2704,14 +2730,16 @@ HttpResponse StreamingResponse(
             try {
               const auto result = generation->Wait(
                   [&](std::string_view piece) {
-                    return connected && filter.Push(piece);
+                    return begin() && filter.Push(piece);
                   },
-                  on_progress);
+                  on_progress, begin);
               stream_log->details = GenerationLogDetails(result);
               RecordServerMetrics(result);
               if (!connected || result.cancelled) {
                 return;
               }
+              if (!begin())
+                return;
               if (!filter.Push({}, true))
                 return;
 
@@ -2778,6 +2806,8 @@ HttpResponse StreamingResponse(
               }
               (void)writer("data: [DONE]\n\n");
             } catch (const TextGenerationError& exception) {
+              if (!started)
+                throw;
               stream_log->error_code = exception.stable_code();
               json::Value error = json::Value::object();
               json::Value detail = json::Value::object();
@@ -2788,6 +2818,8 @@ HttpResponse StreamingResponse(
               stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
             } catch (const std::exception& error) {
+              if (!started)
+                throw;
               stream_log->error_code = "generation_failed";
               json::Value err = json::Value::object();
               json::Value detail = json::Value::object();
@@ -2802,6 +2834,7 @@ HttpResponse StreamingResponse(
             }
           },
       .stream_log = std::move(stream_log),
+      .defer_stream_headers = !request.chat.return_progress,
   };
 }
 
@@ -2984,10 +3017,18 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                     model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     ResponsesOutput output(model, writer, chat);
-    if (!output.Begin()) {
+    bool started = false;
+    const auto begin = [&] {
+      if (started)
+        return true;
+      started = true;
+      if (output.Begin())
+        return true;
       generation->Cancel();
+      return false;
+    };
+    if (writer && chat.return_progress && !begin())
       return json::Value();
-    }
     QuoteTracker quotes;
     StreamingTextFilter filter(
         initial,
@@ -3007,15 +3048,15 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       if (writer && chat.return_progress) {
         on_progress =
             [&](const TextGenerationBackend::PromptProgress& progress) {
-              return output.Progress(progress);
+              return begin() && output.Progress(progress);
             };
       }
-      const auto result =
-          writer
-              ? generation->Wait(
-                    [&](std::string_view piece) { return filter.Push(piece); },
-                    on_progress)
-              : generation->Wait();
+      const auto result = writer ? generation->Wait(
+                                       [&](std::string_view piece) {
+                                         return begin() && filter.Push(piece);
+                                       },
+                                       on_progress, begin)
+                                 : generation->Wait();
       stream_log->details = GenerationLogDetails(result);
       RecordServerMetrics(result);
       if (!writer) {
@@ -3027,6 +3068,8 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
         *timing = value.str();
       }
       if (result.cancelled)
+        return json::Value();
+      if (!begin())
         return json::Value();
       if (!writer)
         filter.Push(result.text);
@@ -3060,7 +3103,7 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       }
       return output.Complete(result);
     } catch (const std::exception& error) {
-      if (!writer)
+      if (!writer || !started)
         throw;
       const auto* generation_error =
           dynamic_cast<const TextGenerationError*>(&error);
@@ -3085,7 +3128,8 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                 [run](const HttpResponse::BodyWriter& writer) {
                   (void)run(writer);
                 },
-            .stream_log = std::move(stream_log)};
+            .stream_log = std::move(stream_log),
+            .defer_stream_headers = !chat.return_progress};
   }
   auto response = run({});
   return {.status = 200,
