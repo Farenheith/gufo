@@ -1472,7 +1472,7 @@ void ParseQwenCalls(
         std::ranges::none_of(
             tools, [&](const auto& tool) { return tool.name == call.name; }))
       complete = false;
-    if (complete && call_quotes.UnclosedAt(marker_begin)) {
+    if (complete && call_quotes.UnclosedFenceAt(marker_begin)) {
       // An unfinished fence is ambiguous. Restore the legacy fallback only for
       // a declared call whose complete arguments satisfy its schema.
       const auto tool =
@@ -1744,13 +1744,17 @@ ParsedGeneration ParseGeneration(
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
     if (text_from_tools.starts_with("<tool_call>"))
-      ParseQwenCalls(text_from_tools, tools, &parsed.tool_calls);
+      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls);
     else
       ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
     std::erase_if(parsed.tool_calls, [&](const auto& call) {
       return std::ranges::none_of(
           tools, [&](const auto& tool) { return tool.name == call.name; });
     });
+    if (parsed.tool_calls.empty() && quotes.UnclosedFenceAt(marker) &&
+        choice != ChatRequest::ToolChoice::kRequired) {
+      return parsed;
+    }
     // An explicit stop can interrupt a call before its closing tags. Keep
     // complete calls, but do not expose an unfinished call as ordinary text.
     if (!parsed.tool_calls.empty() || !enforce_required) {
@@ -1847,7 +1851,7 @@ ParsedGeneration ParseStructuredGeneration(
                                  cursor > 0);
     }
     if (call.tool_calls.empty() && marker != std::string_view::npos &&
-        quotes.UnclosedAt(marker) &&
+        quotes.UnclosedFenceAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
       parsed.text = std::string(raw);
       return parsed;
@@ -2086,6 +2090,7 @@ public:
         remaining.remove_prefix(end_pos + kThinkEnd.size());
         pending_ = std::string(remaining);
         state_ = State::kContent;
+        quotes_.Reset(raw_, offset + end_pos + kThinkEnd.size());
         trim_reasoning_separator_ = true;
       } else {
         std::size_t held =

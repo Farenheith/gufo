@@ -13,14 +13,15 @@ namespace gufo::server {
 inline constexpr std::string_view kThinkStart = "<think>";
 inline constexpr std::string_view kThinkEnd = "</think>";
 
-/// Request-owned quoting state. Only completed spans quote a marker. During
-/// streaming, a marker in an unfinished span remains a possible call; the
-/// final parse decides whether a later closing fence made it documentation.
+/// Request-owned quoting state. Inline backticks protect text across nonblank
+/// lines, including unfinished inline spans. Only fences use the unfinished
+/// call fallback; a later closing fence makes the held marker documentation.
 /// Own the scanned bytes rather than identifying a buffer by its address.
 class QuoteTracker {
 public:
-  void Reset(std::string_view text = {}) {
-    text_.clear();
+  void Reset(std::string_view text = {}, std::size_t origin = 0) {
+    origin = std::min(origin, text.size());
+    text_.assign(origin, ' ');
     spans_.clear();
     first_nonblank_ = std::string_view::npos;
     run_begin_ = 0;
@@ -30,7 +31,7 @@ public:
     fence_size_ = 0;
     fence_char_ = 0;
     closing_fence_ = false;
-    Append(text);
+    Append(text.substr(origin));
   }
 
   void Append(std::string_view piece) {
@@ -38,16 +39,6 @@ public:
     text_.append(piece);
     for (auto cursor = begin; cursor < text_.size(); ++cursor) {
       Read(cursor);
-      for (const auto phase : {kThinkStart, kThinkEnd}) {
-        if (cursor + 1 >= phase.size() &&
-            std::string_view(text_).substr(cursor + 1 - phase.size(),
-                                           phase.size()) == phase) {
-          inline_size_ = fence_size_ = run_size_ = 0;
-          fence_char_ = run_char_ = 0;
-          closing_fence_ = false;
-          first_nonblank_ = std::string_view::npos;
-        }
-      }
     }
     bytes_scanned_ += piece.size();
   }
@@ -71,18 +62,14 @@ public:
           AtLineStart(run_begin_) && position >= fence_begin_ &&
           position < run_begin_)
         return true;
-    } else if (inline_size_ > 0 && run_char_ == '`' &&
-               run_size_ == inline_size_ && position >= inline_begin_ &&
-               position < run_begin_) {
+    } else if (inline_size_ > 0 && position >= inline_begin_) {
       return true;
     }
     return false;
   }
 
-  [[nodiscard]] bool UnclosedAt(std::size_t position) const {
-    return !QuotedAt(position) &&
-           ((fence_size_ > 0 && position >= fence_begin_) ||
-            (inline_size_ > 0 && position >= inline_begin_));
+  [[nodiscard]] bool UnclosedFenceAt(std::size_t position) const {
+    return !QuotedAt(position) && fence_size_ > 0 && position >= fence_begin_;
   }
 
   [[nodiscard]] std::size_t bytes_scanned() const noexcept {
@@ -147,7 +134,12 @@ private:
         fence_size_ = 0;
         fence_char_ = 0;
       }
-      inline_size_ = 0;
+      if (inline_size_ > 0 && first_nonblank_ == std::string_view::npos) {
+        // A blank line ends an unfinished inline quotation, without exposing
+        // the markers it already contained as calls.
+        spans_.push_back({inline_begin_, cursor});
+        inline_size_ = 0;
+      }
       closing_fence_ = false;
       first_nonblank_ = std::string_view::npos;
     } else if (byte != ' ' && byte != '\t' && byte != '\r') {

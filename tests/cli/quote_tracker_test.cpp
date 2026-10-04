@@ -23,10 +23,15 @@ void TestCompletedSpans() {
   for (const auto& item : std::vector<Case>{
            {"plain <marker>", false},
            {"`<marker>`", true},
-           {"`<marker>", false},
-           {"`<marker>\nnext", false},
+           {"`<marker>", true},
+           {"`<marker>\nnext", true},
+           {"`before\n<marker>\nafter`", true},
+           {"``before\n<marker>\nafter``", true},
+           {"`before\n\n<marker>", false},
+           {"`before\n \t\r\n<marker>", false},
+           {"`before <think>\n<marker>`", true},
            {"``<marker>``", true},
-           {"``<marker>`", false},
+           {"``<marker>`", true},
            {"```python\n<marker>\n```", true},
            {"```python\n<marker>\n```\n", true},
            {"```python\n<marker>", false},
@@ -35,7 +40,7 @@ void TestCompletedSpans() {
            {"````\n<marker>\n```", false},
            {"```\n<marker>\n```more text", false},
            {"```\n</think>\n<marker>", false},
-           {"```\n</think>\n`<marker>`", true},
+           {"```\n</think>\n`<marker>`", false},
            {"`literal` and <marker>", false},
            {"```\nexample\n```\n<marker>", false},
        }) {
@@ -62,6 +67,18 @@ void TestUnfinishedFenceDecision() {
   tracker.Reset("plain <marker>");
   Expect(!tracker.QuotedAt(6),
          "reset discards the preceding response's quote state");
+}
+
+void TestExplicitPhaseBoundary() {
+  const std::string text = "```reasoning\n</think>\n<marker>";
+  QuoteTracker tracker;
+  tracker.Reset(text,
+                text.find("</think>") + std::string_view("</think>").size());
+  Expect(!tracker.QuotedAt(text.find("<marker>")),
+         "the actual phase transition starts a fresh quote scope");
+  tracker.Reset("`literal </think>\n<marker>`");
+  Expect(tracker.QuotedAt(18),
+         "spelled phase tags inside inline text do not reset quotes");
 }
 
 void TestOwnershipAndLinearity() {
@@ -92,5 +109,6 @@ int main() {
   TestCompletedSpans();
   TestUnfinishedFenceDecision();
   TestOwnershipAndLinearity();
+  TestExplicitPhaseBoundary();
   std::cout << "quote_tracker_test: passed\n";
 }

@@ -3343,6 +3343,15 @@ void TestToolClosingFraming() {
     std::string content;
   };
   for (const auto& item : std::vector<Case>{
+           {"looks like `" + call + "` and no call.", 0, "",
+            "looks like `" + call + "` and no call."},
+           {"looks like ``" + call + "`` and no call.", 0, "",
+            "looks like ``" + call + "`` and no call."},
+           {"looks like `" + call, 0, "", "looks like `" + call},
+           {"looks like ``" + call, 0, "", "looks like ``" + call},
+           {"`example\n\n" + call, 1, R"({"text":"42"})", "`example\n\n"},
+           {"looks like `literal <think>\n" + call + "`", 0, "",
+            "looks like `literal <think>\n" + call + "`"},
            {call + "\n</invoke>\n</parameter>\n</function>\n", 1,
             R"({"text":"42"})", ""},
            {call + "\n</function>\n" + call, 2, R"({"text":"42"})", ""},
@@ -3459,6 +3468,95 @@ void TestToolClosingFraming() {
           Expect(calls.back().find("function")->member_str("arguments") ==
                      item.argument,
                  "literal arguments survive exactly");
+      }
+    }
+  }
+}
+
+void TestUnconstrainedFenceFallbackChecksSchema() {
+  const std::string prefix = "```python\nprint(1)\n";
+  const std::string valid =
+      "<tool_call>\n<function=f>\n<parameter=text>42</parameter>\n</"
+      "function>\n</tool_call>";
+  const std::string wrong =
+      "<tool_call><function=f><parameter=text>43</parameter></function></"
+      "tool_call>";
+  const std::string missing = "<tool_call><function=f></function></tool_call>";
+  struct Case {
+    std::string text;
+    bool call;
+    std::string content;
+  };
+  for (const auto& item : std::vector<Case>{
+           {prefix + valid, true, prefix},
+           {prefix + wrong, false, prefix + wrong},
+           {prefix + missing, false, prefix + missing},
+           {"looks like `" + valid + "`", false, "looks like `" + valid + "`"},
+           {"looks like ``" + valid + "``", false,
+            "looks like ``" + valid + "``"},
+           {"looks like `" + valid, false, "looks like `" + valid},
+       }) {
+    for (const bool constrained : {false, true}) {
+      for (const bool stream : {false, true}) {
+        for (const bool bytewise : {false, true}) {
+          gufo::server::ChatRequest chat;
+          chat.reasoning.enabled = false;
+          chat.constrained_tools = constrained;
+          Expect(
+              !gufo::server::ParseOpenAiResponseControls(
+                  gufo::json::parse(
+                      R"({"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"text":{"type":"string","const":"42"}},"required":["text"],"additionalProperties":false}}]})"),
+                  &chat),
+              "fallback fixture has valid tool controls");
+          chat.constrained_tools = constrained;
+          FakeBackend backend;
+          backend.tool_format =
+              gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+          if (bytewise)
+            for (const char byte : item.text)
+              backend.pieces.emplace_back(1, byte);
+          else
+            backend.pieces.push_back(item.text);
+          const auto response = gufo::server::CreateOpenAiResponse(
+              Request("{}"), backend, chat, 512, {}, stream);
+          gufo::json::Value output;
+          std::string streamed;
+          if (!stream)
+            output = gufo::json::parse(response.body);
+          else
+            response.streaming_body([&](std::string_view chunk) {
+              const auto offset = chunk.find("data: ");
+              const auto event = gufo::json::parse(chunk.substr(offset + 6));
+              if (event.member_str("type") == "response.output_text.delta")
+                streamed += event.member_str("delta");
+              if (event.member_str("type") == "response.completed")
+                output = *event.find("response");
+              return true;
+            });
+          std::string content;
+          std::size_t calls = 0;
+          for (const auto& part : output.find("output")->items()) {
+            if (part.member_str("type") == "function_call") {
+              ++calls;
+              Expect(part.member_str("name") == "f" &&
+                         part.member_str("arguments") == R"({"text":"42"})",
+                     "fallback emits exactly the declared schema-valid call");
+            }
+            if (part.member_str("type") == "message") {
+              for (const auto& text : part.find("content")->items())
+                content += text.member_str("text");
+            }
+          }
+          Expect(calls == (item.call ? 1u : 0u),
+                 "both parser paths apply fence schema checks and protect "
+                 "inline quotations");
+          Expect(content == item.content,
+                 "quoted documentation and invalid fence examples stay "
+                 "byte-exact");
+          if (stream)
+            Expect(streamed == content,
+                   "streamed documentation agrees with the final response");
+        }
       }
     }
   }
@@ -3673,6 +3771,7 @@ int main() {
   TestToolNameCharacters();
   TestMalformedHistoricalFunctions();
   TestToolClosingFraming();
+  TestUnconstrainedFenceFallbackChecksSchema();
   TestProseAboutTheDialectIsNotACall();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();

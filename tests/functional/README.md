@@ -126,8 +126,10 @@ Tool framing is removed when it directly echoes an accepted call or a client
 `<invoke name="X">` envelope names a declared tool. Other raw XML, standalone
 closers and spelled vocabulary tokens are literal content. A full call naming a
 declared tool inside an unfinished fence uses the legacy fallback only if its
-arguments satisfy the schema; completed fences and balanced inline backticks
-remain documentation. These text-only rules cannot distinguish literal XML
+arguments satisfy the schema; completed fences and inline backticks remain
+documentation. Inline spans can cross nonblank lines and remain protected without
+a closing backtick; the unfinished-call fallback applies only to fences. These
+text-only rules cannot distinguish literal XML
 naming a declared tool from a failed envelope attempt, or an unfinished code
 example from a real call. Actual EOS handling uses token IDs in the backend.
 
