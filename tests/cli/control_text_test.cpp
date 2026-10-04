@@ -63,6 +63,28 @@ void TestMarkerInterplay() {
          "reasoning alone stays literal without markup");
 }
 
+void TestNestedExamples() {
+  // A reply that spells the tags out while it reasons keeps its own block open:
+  // an example pairs with itself instead of closing the outer block.
+  Expect(ControlTextIsLiteral(
+             "assistant\n<think>\nan example: <think> nested </think> and "
+             "still reasoning <|im_end|>"),
+         "a nested example inside reasoning leaves the block open");
+  Expect(ControlTextIsLiteral(
+             "assistant\n<think>\ntext <think> inner </think> more\n"
+             "still reasoning <|im_end|>"),
+         "an example pair inside reasoning leaves the block open");
+  Expect(
+      !ControlTextIsLiteral(
+          "assistant\n<think>\ntext <think> inner </think> more\n</think>\n\n"
+          "the answer <|im_end|>"),
+      "the outer close after an example still ends the block");
+  Expect(
+      !ControlTextIsLiteral(
+          "assistant\n<think>\nreasoning\n</think>\n\nanswer </think> after"),
+      "a close outside reasoning does not open a block");
+}
+
 void TestByteWiseReading() {
   const std::string text = "assistant\n<think>\nquoted `snippet\n";
   Expect(ControlTextIsLiteral(text), "the chunked text is literal");
@@ -79,6 +101,7 @@ int main() {
   TestReasoningScope();
   TestQuoteScope();
   TestMarkerInterplay();
+  TestNestedExamples();
   TestByteWiseReading();
   std::cout << "control_text_test passed\n";
   return 0;

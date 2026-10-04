@@ -20,28 +20,28 @@ namespace gufo::server {
   if (quotes.OpenAtEnd()) {
     return true;
   }
-  // The markers alternate, so the last one decides. A closing marker inside a
-  // quote still ends the block: `</think>` keeps its framing meaning.
-  bool reasoning = false;
+  // Track the block, not a toggle. A reply that spells the tags out — an
+  // example inside its own reasoning, a nested block — keeps its outer block
+  // open, because the example pairs with itself. A close outside reasoning is
+  // ignored rather than opening a block.
+  int depth = 0;
   std::size_t cursor = 0;
   while (cursor < text.size()) {
-    if (reasoning) {
-      const auto close = text.find(kThinkEnd, cursor);
-      if (close == std::string_view::npos) {
-        break;
-      }
-      reasoning = false;
+    const auto open = text.find(kThinkStart, cursor);
+    const auto close = text.find(kThinkEnd, cursor);
+    if (close != std::string_view::npos &&
+        (open == std::string_view::npos || close < open)) {
+      depth = depth > 0 ? depth - 1 : 0;
       cursor = close + kThinkEnd.size();
-    } else {
-      const auto open = text.find(kThinkStart, cursor);
-      if (open == std::string_view::npos) {
-        break;
-      }
-      reasoning = true;
-      cursor = open + kThinkStart.size();
+      continue;
     }
+    if (open == std::string_view::npos) {
+      break;
+    }
+    ++depth;
+    cursor = open + kThinkStart.size();
   }
-  return reasoning;
+  return depth > 0;
 }
 
 }  // namespace gufo::server
