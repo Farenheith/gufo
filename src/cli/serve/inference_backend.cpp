@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -940,10 +941,26 @@ private:
   void* probe_buffer_{};
 };
 
+// The tokenizer's control tokens, held in a trie once per model load so every
+// request shares one immutable structure and none of them copies it (#383).
+std::shared_ptr<const ControlTokensTrie> BuildControlTokensTrie(
+    const tokenization::QwenTokenizer& tokenizer) {
+  std::vector<std::string> spellings;
+  spellings.reserve(tokenizer.SpecialTokens().size());
+  for (const auto& entry : tokenizer.SpecialTokens()) {
+    spellings.push_back(entry.first);
+  }
+  return std::make_shared<const ControlTokensTrie>(spellings);
+}
+
 class QwenTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+  [[nodiscard]] std::shared_ptr<const ControlTokensTrie> control_tokens_trie()
+      const override {
+    return control_tokens_trie_;
   }
   QwenTextRunner(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
@@ -956,6 +973,7 @@ public:
         max_context_(max_context),
         speculative_options_(speculative_options),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
+    control_tokens_trie_ = BuildControlTokensTrie(model_->GetTokenizer());
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -1566,6 +1584,7 @@ private:
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  std::shared_ptr<const ControlTokensTrie> control_tokens_trie_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -2473,6 +2492,10 @@ public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
+  [[nodiscard]] std::shared_ptr<const ControlTokensTrie> control_tokens_trie()
+      const override {
+    return control_tokens_trie_;
+  }
   QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
@@ -2482,6 +2505,7 @@ public:
         max_context_(max_context),
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens) {
+    control_tokens_trie_ = BuildControlTokensTrie(model_->tokenizer());
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2945,6 +2969,7 @@ private:
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  std::shared_ptr<const ControlTokensTrie> control_tokens_trie_;
 };
 #endif
 
@@ -3644,6 +3669,21 @@ ReasoningOptions InferenceBackend::reasoning_defaults() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr ? state->reasoning_defaults : ReasoningOptions{};
+#else
+  return {};
+#endif
+}
+
+std::shared_ptr<const ControlTokensTrie> InferenceBackend::control_tokens_trie()
+    const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr) {
+    return {};
+  }
+  // Shared ownership: a request keeps the trie alive even if the runner that
+  // built it is released while the response is still being assembled.
+  return state->scheduler->runner().control_tokens_trie();
 #else
   return {};
 #endif

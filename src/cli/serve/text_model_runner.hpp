@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/core/sampling.hpp"
 
@@ -310,6 +311,13 @@ public:
   [[nodiscard]] virtual sampling::JsonConstraint::ToolFormat ToolFormat()
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
+  }
+  /// The tokenizer's control tokens, or null when it owns none. The parser
+  /// treats a pipe-wrapped spelling in generated text as framing only when this
+  /// trie knows it; every other lookalike is literal data (#383).
+  [[nodiscard]] virtual std::shared_ptr<const ControlTokensTrie>
+  control_tokens_trie() const {
+    return {};
   }
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;

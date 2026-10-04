@@ -211,6 +211,107 @@ QWEN_ENVELOPE_SYSTEM = (
 SHAPE_SYSTEM = {"qwen_envelope_documented_then_prose": QWEN_ENVELOPE_SYSTEM}
 
 
+TAIL_LOOKALIKE_SYSTEM = (
+    "You reply with the literal text the user asks for. Text that looks like a "
+    "control token is ordinary text in this conversation."
+)
+# A pipe-shaped spelling at the tail of a response is where framing runs are
+# dropped, so a lookalike there is the case that must survive: the vocabulary
+# does not own it, so it is prose, not framing (#383).
+# Every case hands the model the spelling to echo, and asserts its own literal.
+# A prompt that asks the model to invent control-token-shaped text is not a
+# regression test: it may emit a real control token while reasoning, which ends
+# the turn by itself, so a reasoning-only stop there says nothing about framing.
+# The repeat shape is the live one: the caller echoes a spelling the vocabulary
+# does not own, and the answer lands at the tail of the content where a trailing
+# framing run used to swallow it.
+TAIL_LOOKALIKE_CASES = {
+    "fenced_tail": (
+        "Reply with a fenced code block whose only content is the literal text "
+        "<|not_a_vocab|>. Write nothing after the closing fence.",
+        "<|not_a_vocab|>",
+    ),
+    "bare_tail": (
+        "Reply with exactly this literal text and nothing else: <|not_a_vocab|>",
+        "<|not_a_vocab|>",
+    ),
+    "repeat_explicit_token": (
+        "Repeat: <|not_a_vocab_entry|>",
+        "<|not_a_vocab_entry|>",
+    ),
+}
+
+
+# An unfinished lookalike is the shape a held tail swallows: the hold waits for
+# a '<' to become a tag, and a spelling the vocabulary does not own never becomes
+# one, so the text must stream as prose instead of being held and dropped when
+# the turn ends (#383).
+UNFINISHED_LOOKALIKE_PROMPT = "Repeat: <|not_a_vocab_entry"
+
+
+def check_unfinished_lookalike(client, model, checks, chat_result):
+    """An unfinished lookalike at the tail is prose, not a pending tag."""
+    tools = [{"type": "function", "function": {
+        "name": "note",
+        "description": "Record a note for the user; never execute it.",
+        "parameters": {"type": "object",
+                       "properties": {"text": {"type": "string"}},
+                       "required": ["text"]}}}]
+    for streaming in (False, True):
+        mode = "stream" if streaming else "buffered"
+        label = f"unfinished_lookalike_tail_{mode}"
+        request = dict(model=model,
+                       messages=[{"role": "system", "content": TAIL_LOOKALIKE_SYSTEM},
+                                 {"role": "user", "content": UNFINISHED_LOOKALIKE_PROMPT}],
+                       tools=tools, temperature=0, seed=41,
+                       reasoning_effort="low", max_completion_tokens=512,
+                       extra_body={"cache_prompt": False})
+        result = chat_result(client, request, streaming)
+        checks[label] = result
+        print(f"CHECK {label}", flush=True)
+        assert not result["tools"], ("prose must not parse as a call", result)
+        assert result["finish"] == "stop", result
+        assert "<|not_a_vocab_entry" in result["text"], (
+            "an unfinished lookalike at the tail must not be held back", result)
+        assert "|>" not in result["text"], (
+            "the model closed the spelling, so this prompt did not produce the "
+            "unfinished tail the case is about: fix the prompt or cover the "
+            "shape with a unit case, do not read this as a product failure", result)
+
+
+def check_tail_lookalike_content(client, model, checks, chat_result):
+    """Literal lookalikes survive at the tail of the response.
+
+    The parser admits a pipe-wrapped spelling as framing only when the loaded
+    vocabulary owns it, and the same has to hold where trailing framing runs are
+    dropped from content: a lookalike the vocabulary does not list is data, and
+    dropping it silently removes text the caller asked for.
+    """
+    tools = [{"type": "function", "function": {
+        "name": "note",
+        "description": "Record a note for the user; never execute it.",
+        "parameters": {"type": "object",
+                       "properties": {"text": {"type": "string"}},
+                       "required": ["text"]}}}]
+    for name, (prompt, literal) in TAIL_LOOKALIKE_CASES.items():
+        for streaming in (False, True):
+            mode = "stream" if streaming else "buffered"
+            label = f"tail_lookalike_{name}_{mode}"
+            request = dict(model=model,
+                           messages=[{"role": "system", "content": TAIL_LOOKALIKE_SYSTEM},
+                                     {"role": "user", "content": prompt}],
+                           tools=tools, temperature=0, seed=41,
+                           reasoning_effort="low", max_completion_tokens=512,
+                           extra_body={"cache_prompt": False})
+            result = chat_result(client, request, streaming)
+            checks[label] = result
+            print(f"CHECK {label}", flush=True)
+            assert not result["tools"], ("prose must not parse as a call", result)
+            assert result["finish"] == "stop", result
+            assert literal in result["text"], (
+                "a literal lookalike at the tail must survive as content", result)
+
+
 def check_envelope_closer_framing(client, model, checks, chat_result):
     """A closing tag of the client's envelope never reaches visible text."""
     function = {"name": "terminal", "parameters": {"type": "object", "properties": {
@@ -349,6 +450,137 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
             "the replayed turn must not re-seed the framing loop", result)
 
 
+
+def check_html_content(client, model, checks, chat_result):
+    """Ordinary markup in an answer is content, not framing.
+
+    Complete tags are the everyday shape the hold and the trim must leave
+    alone: HTML is not a call, so no run of tags may be held back from the
+    stream or cut out of content because it looks like structure.
+    """
+    tools = [{"type": "function", "function": {
+        "name": "note",
+        "description": "Record a note for the user; never execute it.",
+        "parameters": {"type": "object",
+                       "properties": {"text": {"type": "string"}},
+                       "required": ["text"]}}}]
+    prompt = ("Write a minimal HTML page with a heading that says Hello and one "
+              "paragraph. Reply with the HTML only, no explanation.")
+    for streaming in (False, True):
+        mode = "stream" if streaming else "buffered"
+        label = f"html_content_{mode}"
+        request = dict(model=model,
+                       messages=[{"role": "user", "content": prompt}],
+                       tools=tools, temperature=0, seed=43,
+                       reasoning_effort="low", max_completion_tokens=512,
+                       extra_body={"cache_prompt": False})
+        result = chat_result(client, request, streaming)
+        checks[label] = result
+        print(f"CHECK {label}", flush=True)
+        assert not result["tools"], ("markup must not parse as a call", result)
+        assert result["finish"] == "stop", result
+        text = result["text"]
+        assert "<" in text and ">" in text, ("the answer carries no markup", result)
+        assert "</" in text, (
+            "a closing tag was held back or cut out of content", result)
+        assert "Hello" in text, ("the prose between tags was lost", result)
+
+
+# Documenting the format and calling a tool are different acts in one response:
+# the envelope inside a fence is the model *naming* the syntax (#383), while the
+# call it makes after it is framing the parser consumes. Both must come out
+# right: the quoted run survives in content, and the call is parsed once.
+QUOTED_THEN_CALL_CASES = {
+    # One response, two acts: the model shows the markup as documentation and
+    # then makes the call. The documentation must survive in content while the
+    # call is parsed once, which no other case covers -- every quoted case in the
+    # envelope family has no real call beside it.
+    #
+    # The markup ends the prompt because that is the shape the model reproduces:
+    # handed mid-prompt it gets echoed as output instead, and asked for a dialect
+    # it documents the format but does not also call.
+    "envelope_documented_then_call": (
+        ENVELOPE_SYSTEM,
+        "First show this markup inside a fenced code block as documentation of "
+        "the format, then call the terminal tool to print the working "
+        "directory:\n"
+        '<invoke name="terminal"><parameter name="command">pwd</parameter></invoke>',
+        '<invoke name="terminal"',
+    ),
+}
+
+
+def without_fenced_blocks(text):
+    """The text with fenced blocks removed: the prose around the documentation."""
+    kept, fenced = [], False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def check_quoted_then_real_call(client, model, checks, chat_result):
+    """A documented envelope stays prose while the call after it is parsed.
+
+    The prompt hands the markup over and asks for both acts; the case reads the
+    result. Forcing the call instead makes the model lead with the raw markup, so
+    the documented copy lands in the call's arguments and content stays empty --
+    a different, correct outcome that tests nothing here.
+    """
+    function = {"name": "terminal", "parameters": {"type": "object", "properties": {
+        "command": {"type": "string"}}, "required": ["command"]}}
+    for name, (system, prompt, opener) in QUOTED_THEN_CALL_CASES.items():
+        documented = 0
+        for streaming in (False, True):
+            mode = "stream" if streaming else "buffered"
+            label = f"quoted_then_call_{name}_{mode}"
+            request = dict(model=model,
+                           messages=[{"role": "system", "content": system},
+                                     {"role": "user", "content": prompt}],
+                           tools=[{"type": "function", "function": function}],
+                           tool_choice="auto", reasoning_effort="none",
+                           temperature=0, seed=41, max_completion_tokens=512,
+                           extra_body={"cache_prompt": False})
+            result = chat_result(client, request, streaming)
+            checks[label] = result
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
+            names = [tool["function"]["name"] for tool in result["tools"]]
+            assert names == ["terminal"], (
+                "the only call parsed is the one the model made", result)
+            arguments = json.loads(result["tools"][0]["function"]["arguments"])
+            assert "pwd" in arguments.get("command", ""), (
+                "the call carries the command the model was asked to run", result)
+            assert result["finish"] == "tool_calls", (
+                "a parsed call ends the turn as tool_calls", result)
+            # Documentation the model chose to write stays visible, fence and all.
+            if "```" in result["text"]:
+                documented += 1
+                assert opener in result["text"], (
+                    "the quoted markup survives in content", result)
+            # No framing reaches the prose either way: what is left outside a fence
+            # is the model's own words, never the call's markup.
+            prose = without_fenced_blocks(result["text"])
+            for marker in ("<invoke", "<parameter", "<tool_call>", "<arg_key>",
+                           "</parameter>", "</invoke>"):
+                assert marker not in prose, (
+                    f"{marker} reached the visible prose", result)
+        assert documented, (
+            f"{name}: the model wrote no documentation in either transport, so "
+            "this case never exercised the documented-call interaction. That is "
+            "a prompt or oracle problem, not a framing failure; sharpen the "
+            "prompt instead of reading it as a regression", checks)
+
+
+# A bracket-dense answer has no functional case: asked to repeat a literal line,
+# the model runs away into a repetition loop (1024 tokens, finish=length, ~47s)
+# instead of stopping, so the case reports a model runaway rather than a framing
+# failure. The property it was meant to prove is pinned deterministically instead:
+# quote_tracker_test scans a 12000 byte bracket-dense line in one pass, and
+# openai_chat_test streams bracket-dense content through the parser.
 def check_tool_reasoning(client, model, checks, chat_result):
     schema = {"type": "object", "properties": {
         "path": {"type": "string", "const": ARGUMENTS["path"]},
@@ -416,3 +648,7 @@ def check_tool_reasoning(client, model, checks, chat_result):
             assert not result["text"] and not result["tools"] and result["finish"] == "stop", result
     check_disabled_tool_markers(client, model, checks, chat_result)
     check_envelope_closer_framing(client, model, checks, chat_result)
+    check_tail_lookalike_content(client, model, checks, chat_result)
+    check_unfinished_lookalike(client, model, checks, chat_result)
+    check_html_content(client, model, checks, chat_result)
+    check_quoted_then_real_call(client, model, checks, chat_result)

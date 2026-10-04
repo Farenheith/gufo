@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -289,6 +290,13 @@ public:
     return {};
   }
   [[nodiscard]] virtual ReasoningOptions reasoning_defaults() const {
+    return {};
+  }
+  /// The loaded tokenizer's control tokens, or null when it owns none. The
+  /// parser treats a pipe-wrapped spelling as call framing only when this trie
+  /// knows it; every other lookalike stays literal argument data (#383).
+  [[nodiscard]] virtual std::shared_ptr<const ControlTokensTrie>
+  control_tokens_trie() const {
     return {};
   }
   [[nodiscard]] virtual InitialOutputState initial_output_state(

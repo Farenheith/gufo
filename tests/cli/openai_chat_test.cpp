@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/control_tokens_trie.hpp"
 #include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 
@@ -73,6 +74,13 @@ private:
   const std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format_;
 };
 
+/// A trie over the spellings a test wants the parser to recognise.
+std::shared_ptr<const gufo::server::ControlTokensTrie> MakeControlTokensTrie(
+    std::initializer_list<std::string> spellings) {
+  return std::make_shared<const gufo::server::ControlTokensTrie>(
+      std::vector<std::string>(spellings));
+}
+
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
@@ -82,6 +90,12 @@ public:
   }
   [[nodiscard]] gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning_defaults_value;
+  }
+  /// The control-token vocabulary the parser consults. Null by default: a
+  /// pipe-wrapped spelling is argument data unless a test declares it here.
+  [[nodiscard]] std::shared_ptr<const gufo::server::ControlTokensTrie>
+  control_tokens_trie() const override {
+    return control_tokens_trie_;
   }
   [[nodiscard]] InitialOutputState initial_output_state(
       const gufo::server::ChatRequest& request) const override {
@@ -193,6 +207,7 @@ public:
 
   std::vector<std::string> pieces;
   std::vector<PromptProgress> progress;
+  std::shared_ptr<const gufo::server::ControlTokensTrie> control_tokens_trie_;
   std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format;
   std::string cache_miss_reason;
   FinishReason finish_reason{FinishReason::kStop};
@@ -808,6 +823,11 @@ void TestQwenToolBoundariesAndSchema() {
         Case{"<tool_call><function=f><parameter=text>literal </think>"
              "</parameter></function></tool_call>",
              1, R"({"text":"literal </think>"})"},
+        // A pipe-wrapped spelling that is not a vocabulary token is argument
+        // data, not framing: nothing in the output made it a control token.
+        Case{"<tool_call><function=f><parameter=text>\n<|not_a_vocab_entry|>\n"
+             "</parameter></function></tool_call>",
+             1, R"({"text":"<|not_a_vocab_entry|>"})"},
         // One newline on each side of a value is template framing; a file's
         // final newline, indentation and an empty value survive.
         Case{"<tool_call>\n<function=f>\n<parameter=text>\n  line 1\n"
@@ -3424,6 +3444,11 @@ head -12 /tmp/mergetree.txt)call";
       body["tool_choice"] = "auto";
       FakeBackend backend;
       backend.tool_format = item.format;
+      // The pipe tokens these cases spell are real control tokens; declaring
+      // them keeps the framing rejection's intent explicit. A model that spells
+      // a lookalike is not naming one of these.
+      backend.control_tokens_trie_ = MakeControlTokensTrie(
+          {"<|im_end|>", "<|endoftext|>", "<|tool_call|>"});
       for (char byte : item.text)
         backend.pieces.emplace_back(1, byte);
       const auto response =
@@ -3591,11 +3616,114 @@ void TestProseAboutTheDialectIsNotACall() {
   }
 }
 
+void TestControlTokensTrie() {
+  const gufo::server::ControlTokensTrie trie(std::vector<std::string>(
+      {"<|im_end|>", "<|endoftext|>", "<|tool_call|>", "<|im_start|>"}));
+  Expect(trie.FindFirst("<|im_end|>") == 0, "a spelling matches at its start");
+  Expect(trie.FindFirst("say <|im_end|> now") == 4,
+         "a spelling matches inside text");
+  Expect(trie.FindFirst("<|not_a_vocab_entry|>") == std::string_view::npos,
+         "a lookalike is not a spelling");
+  Expect(trie.FindFirst("<|im|>") == std::string_view::npos,
+         "a partial spelling is not a spelling");
+  Expect(trie.FindFirst("<|im_start|>") == 0,
+         "a shared prefix does not end a longer spelling early");
+  // No spelling carries '<', so a failed walk can only resume at the root and
+  // the next '<' starts a fresh candidate.
+  Expect(trie.FindFirst("<|<|im_end|>") == 2,
+         "a failed walk restarts at the root");
+  Expect(trie.FindFirst("<|im_end|>", 0) == std::string_view::npos,
+         "a limit of zero excludes a spelling starting at it");
+  Expect(trie.FindFirst("x<|im_end|>y", 1) == std::string_view::npos,
+         "the limit excludes a spelling that starts at it");
+  Expect(trie.FindFirst("x<|im_end|>y", 2) == 1,
+         "a spelling starting before the limit matches");
+  Expect(gufo::server::ControlTokensTrie().FindFirst("<|im_end|>") ==
+             std::string_view::npos,
+         "an empty trie matches nothing");
+
+  // A vocabulary also lists spellings that are not control tokens in model
+  // output. Only the pipe-wrapped shape may end an envelope; matching an
+  // envelope tag would discard an argument that legitimately contains it.
+  const gufo::server::ControlTokensTrie mixed(std::vector<std::string>(
+      {"<tool_call>", "</tool_call>", "<function=", "<|im_end|>"}));
+  Expect(mixed.FindFirst("x<|im_end|>") == 1,
+         "a pipe-wrapped spelling is indexed");
+  Expect(mixed.FindFirst("<tool_call>") == std::string_view::npos,
+         "an envelope tag is not a control token spelling");
+  Expect(mixed.FindFirst("</tool_call>") == std::string_view::npos,
+         "a closing envelope tag is not a control token spelling");
+  Expect(mixed.FindFirst("<function=") == std::string_view::npos,
+         "a call tag without bars is not a control token spelling");
+}
+
+/// A bracket-dense line, in units that never split across pieces.
+std::string AngleUnits(std::size_t units) {
+  std::string text;
+  text.reserve(units * 3);
+  for (std::size_t i = 0; i < units; ++i)
+    text += "<a>";
+  return text;
+}
+
+/// Bracket-dense content is ordinary text: every '<' in it is one probe for the
+/// parser, and a held or dropped run shows up as text that lost its brackets.
+///
+/// This is the deterministic form of the live case. Asked to repeat such a
+/// line, a model runs away into a repetition loop and never stops, so the live
+/// case reports a model runaway rather than a framing failure.
+void TestBracketDenseContent() {
+  constexpr std::size_t kUnits = 2000;
+  constexpr std::size_t kUnitsPerPiece = 30;
+  const std::string dense = AngleUnits(kUnits);
+  // The tail is what the framing rules act on: a pipe-shaped spelling the
+  // vocabulary does not own is prose, whether it is complete or still arriving.
+  const std::vector<std::string> tails{"", "<|not_a_vocab|>",
+                                       "<|not_a_vocab_entry"};
+  for (const std::string& tail : tails) {
+    FakeBackend backend;
+    for (std::size_t offset = 0; offset < dense.size();
+         offset += kUnitsPerPiece * 3)
+      backend.pieces.push_back(dense.substr(offset, kUnitsPerPiece * 3));
+    if (!tail.empty())
+      backend.pieces.push_back(tail);
+
+    auto body = gufo::json::parse(
+        R"({"model":"test-model","messages":[{"role":"user","content":"echo it"}],)"
+        R"("reasoning_effort":"none"})");
+    const auto buffered =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    const auto parsed = gufo::json::parse(buffered.body);
+    const auto* message = parsed.find("choices")->items()[0].find("message");
+    Expect(message->member_str("content") == dense + tail,
+           "bracket-dense prose and its tail survive verbatim");
+
+    body["stream"] = true;
+    const auto streamed =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    std::string content;
+    streamed.streaming_body([&](std::string_view chunk) {
+      if (chunk == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(chunk.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        const auto* delta = choice.find("delta");
+        if (delta)
+          content += delta->member_str("content");
+      }
+      return true;
+    });
+    Expect(content == dense + tail,
+           "the streaming path retains bracket-dense prose and its tail");
+  }
+}
+
 int main() {
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();
   TestToolMarkersWhenToolsDisabled();
+  TestBracketDenseContent();
   TestStopSequencesAndDefaultFields();
   TestStructuredResponseFormat();
   TestStructuredToolTruncation();
@@ -3634,6 +3762,7 @@ int main() {
   TestToolNameCharacters();
   TestMalformedHistoricalFunctions();
   TestToolClosingFraming();
+  TestControlTokensTrie();
   TestProseAboutTheDialectIsNotACall();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
