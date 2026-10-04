@@ -875,6 +875,8 @@ void TestQwenToolBoundariesAndSchema() {
         body["chat_template_kwargs"] = Value::object();
         body["chat_template_kwargs"]["enable_thinking"] = reasoning;
         FakeBackend backend;
+        backend.control_tokens_trie_ =
+            MakeControlTokensTrie({"<|im_end|>", "<|endoftext|>"});
         const auto text =
             (reasoning ? "Considering. </think>" : "") + item.text;
         // Split every marker and argument across token callbacks.
@@ -1949,11 +1951,23 @@ void TestStrictToolSchema() {
     const auto response =
         gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
     std::string output = response.body;
+    std::string content;
+    const auto collect = [&](const gufo::json::Value& event) {
+      for (const auto& choice : event.find("choices")->items()) {
+        const auto* message = choice.find(stream ? "delta" : "message");
+        if (message)
+          content += message->member_str("content");
+      }
+    };
     if (response.streaming_body)
       response.streaming_body([&](std::string_view chunk) {
         output += chunk;
+        if (chunk != "data: [DONE]\n\n")
+          collect(gufo::json::parse(chunk.substr(6)));
         return true;
       });
+    else
+      collect(gufo::json::parse(response.body));
     Expect(response.status == 200 && backend.last_request.constrained_tools &&
                !backend.last_request.response_format &&
                !backend.last_request.parallel_tool_calls &&
@@ -1963,8 +1977,7 @@ void TestStrictToolSchema() {
            "independently of response_format");
     Expect(
         output.find("\"finish_reason\":\"tool_calls\"") != std::string::npos &&
-            output.find("Calling f. ") != std::string::npos &&
-            output.find(" After f.") != std::string::npos &&
+            content == "Calling f.  After f." &&
             output.find("<think>x</think></tool_call>") != std::string::npos &&
             output.find("reasoning_content") == std::string::npos,
         "strict tool payload markers remain argument data in buffered and "
@@ -2026,16 +2039,25 @@ void TestStrictToolSchema() {
     body["stream"] = stream;
     const auto response =
         gufo::server::HandleOpenAiChat(Request(body.dump()), prose);
-    std::string output = response.body;
+    std::string content;
     if (response.streaming_body)
       response.streaming_body([&](std::string_view chunk) {
-        output += chunk;
+        if (chunk == "data: [DONE]\n\n")
+          return true;
+        const auto event = gufo::json::parse(chunk.substr(6));
+        for (const auto& choice : event.find("choices")->items())
+          if (const auto* delta = choice.find("delta"))
+            content += delta->member_str("content");
         return true;
       });
+    else
+      content = gufo::json::parse(response.body)
+                    .find("choices")
+                    ->items()[0]
+                    .find("message")
+                    ->member_str("content");
     Expect(
-        response.status == 200 &&
-            (output.find("\"content\":\"<\"") != std::string::npos ||
-             output.find("\"content\":\"A literal <\"") != std::string::npos),
+        response.status == 200 && content == "A literal <",
         "automatic strict tools preserve ordinary text ending with a partial "
         "marker");
   }
@@ -3317,6 +3339,29 @@ head -12 /tmp/mergetree.txt)call";
             R"({"text":"42"})", prose},
        Case{call + "\n</function>\n<|tool_call|>\n" + call, 2,
             R"({"text":"42"})", ""},
+       // Native orphan parameters are framing too, even without a named call.
+       // The opener must stay held while its closing tags are still arriving.
+       Case{"Planning fixture.\n<parameter=text>\nSYNTHETIC_COMMAND\n"
+            "</parameter>\n</function>\n</tool_call>\n",
+            0, "", "Planning fixture.",
+            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
+       Case{"Planning fixture.\n<function=f>\n<parameter=text>\n"
+            "SYNTHETIC_COMMAND\n</parameter>\n</function>\n",
+            0, "", "Planning fixture.",
+            gufo::sampling::JsonConstraint::ToolFormat::kQwen},
+       Case{"Native syntax:\n```xml\n<parameter=text>\nSYNTHETIC_COMMAND\n"
+            "</parameter>\n</function>\n</tool_call>\n```",
+            0, "",
+            "Native syntax:\n```xml\n<parameter=text>\nSYNTHETIC_COMMAND\n"
+            "</parameter>\n</function>\n</tool_call>\n```",
+            gufo::sampling::JsonConstraint::ToolFormat::kQwen, false},
+       Case{
+           "<tool_call><function=f><parameter=text>\n<parameter=command>"
+           "SYNTHETIC_COMMAND</parameter></function></tool_call>"
+           "\n</parameter></function></tool_call>",
+           1,
+           R"({"text":"<parameter=command>SYNTHETIC_COMMAND</parameter></function></tool_call>"})",
+           "", gufo::sampling::JsonConstraint::ToolFormat::kQwen},
        // A dropped parameter closer must not fold the envelope that follows it
        // into the value the client executes.
        Case{"<tool_call><function=f><parameter=text>df -h /home<|im_end|>==="
@@ -3491,15 +3536,14 @@ head -12 /tmp/mergetree.txt)call";
                          found->items().end());
         }
       }
-      if (calls.size() != item.calls ||
-          Trimmed(content) != Trimmed(item.content))
+      if (calls.size() != item.calls || content != item.content)
         std::cerr << "Framing input: " << item.text << "\nstream: " << stream
                   << "\nExpected calls: " << item.calls
                   << ", actual: " << calls.size()
                   << "\nExpected content: " << item.content
                   << "\nActual content: " << content << '\n';
       Expect(calls.size() == item.calls, "only complete calls are emitted");
-      Expect(Trimmed(content) == Trimmed(item.content),
+      Expect(content == item.content,
              "response content carries no tool framing");
       if (item.framing_free)
         Expect(content.find("</") == std::string::npos &&

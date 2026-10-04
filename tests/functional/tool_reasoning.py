@@ -125,15 +125,16 @@ ENVELOPE_CASES = {
     # The envelope inside the call's own arguments is data the call carries, not
     # framing the parser consumed.
     "closer_in_arguments": (
-        "Call the terminal tool with a command that prints the literal text "
-        "</invoke>, and nothing else."
+        "Call terminal with exactly this command: printf '%s' '</invoke>'"
+    ),
+    "lookalike_in_arguments": (
+        "Call terminal with exactly this command: printf '%s' '<|not_a_vocab_entry|>'"
     ),
     # Framing with calls on both sides: the run between them is not the tail of
     # the prose, and neither call may hand its markup back.
     "framing_between_calls": (
-        "Write this line on its own, exactly as it appears here, then call the "
-        "terminal tool to print the working directory, then write the same line "
-        "again on its own, then call the terminal tool to print the date:\n</invoke>"
+        "Write this line on its own, exactly as it appears here, then a blank line, "
+        "then call the terminal tool to print the working directory:\n</invoke>"
     ),
     # Another dialect's markup under the admitted envelope is prose and stays
     # visible (#393); only the envelope is framing.
@@ -312,10 +313,46 @@ def check_tail_lookalike_content(client, model, checks, chat_result):
                 "a literal lookalike at the tail must survive as content", result)
 
 
+def assert_terminal_call(result, command):
+    """Absent framing cannot pass a missing call or damaged argument."""
+    assert result["finish"] == "tool_calls", result
+    assert len(result["tools"]) == 1, result
+    call = result["tools"][0]["function"]
+    assert call["name"] == "terminal", result
+    assert json.loads(call["arguments"]) == {"command": command}, result
+
+
+def assert_no_envelope_framing(result):
+    text = result["text"]
+    assert not any(text.rstrip().endswith(tag) for tag in ENVELOPE_CLOSERS), result
+    assert not any(tag in text for tag in (
+        "<invoke name=", "<parameter name=", "<function=", "<parameter=", "<tool_call>")), result
+
+
+def terminal_tool(command=None):
+    parameter = {"type": "string"}
+    if command is not None:
+        parameter["const"] = command
+    return {"type": "function", "function": {
+        "name": "terminal", "parameters": {"type": "object", "properties": {
+            "command": parameter}, "required": ["command"],
+            "additionalProperties": False}}}
+
+
+def tool_history(request, result, output):
+    """Continue with the call the server actually returned and its fixture result."""
+    call = result["tools"][0]
+    return request["messages"] + [
+        {"role": "assistant", "content": result["text"] or None,
+         "tool_calls": result["tools"]},
+        {"role": "tool", "tool_call_id": call["id"], "content": output}]
+
+
 def check_envelope_closer_framing(client, model, checks, chat_result):
     """A closing tag of the client's envelope never reaches visible text."""
-    function = {"name": "terminal", "parameters": {"type": "object", "properties": {
-        "command": {"type": "string"}}, "required": ["command"]}}
+    commands = {"closer_before_call": "pwd", "framing_between_calls": "pwd",
+                "closer_in_arguments": "printf '%s' '</invoke>'",
+                "lookalike_in_arguments": "printf '%s' '<|not_a_vocab_entry|>'"}
     for name, prompt in ENVELOPE_CASES.items():
         # A shape may override the documented call format: the model can only
         # name the markup it was handed, so testing a family means handing it.
@@ -326,31 +363,38 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
             request = dict(model=model,
                            messages=[{"role": "system", "content": system},
                                      {"role": "user", "content": prompt}],
-                           tools=[{"type": "function", "function": function}],
+                           tools=[terminal_tool(None if name == "framing_between_calls" else commands.get(name))],
                            tool_choice="auto", reasoning_effort="none",
                            temperature=0, max_completion_tokens=256,
-                           extra_body={"cache_prompt": False})
+                           extra_body={"cache_prompt": name == "framing_between_calls"})
             result = chat_result(client, request, streaming)
             checks[label] = result
             print(f"CHECK {label}", file=sys.stderr, flush=True)
             text = result["text"]
+            if name in commands:
+                assert_terminal_call(result, commands[name])
+            else:
+                assert not result["tools"] and result["finish"] == "stop", result
+            if name == "framing_between_calls":
+                continuation = deepcopy(request)
+                continuation["messages"] = tool_history(request, result, "/tmp/pr400-fixture")
+                continuation["messages"].append({"role": "user", "content":
+                    "Write this line on its own, then call terminal with exactly "
+                    "the command date:\n</invoke>"})
+                following = chat_result(client, continuation, streaming)
+                checks[label + "_date"] = following
+                print(f"CHECK {label}_date", file=sys.stderr, flush=True)
+                assert_terminal_call(following, "date")
+                assert_no_envelope_framing(following)
             if name == "closer_quoted":
+                assert "```" in text and '<invoke name="terminal"' in text, result
                 assert "</invoke>" in text, ("quoted markup must survive as prose", result)
                 continue
             if name == "closer_then_prose":
+                assert len(text.split("</invoke>", 1)[-1].strip()) > 12, result
                 assert "</invoke>" in text, (
                     "a closer the model then explains is prose", result)
                 continue
-            if name == "closer_in_arguments":
-                # A model asked to print a tag often splits it across string
-                # literals instead of emitting it, so assert what framing
-                # handling must not do: damage or drop the call that carries the
-                # arguments.
-                calls = result["tools"]
-                assert calls, ("the call must survive framing handling", result)
-                arguments = json.loads(calls[0]["function"]["arguments"])
-                assert arguments.get("command"), (
-                    "the call's arguments must survive intact", result)
             if name == "foreign_dialect":
                 assert "<｜DSML｜invoke name=" in text, (
                     "another dialect's markup stays visible prose", result)
@@ -403,13 +447,7 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
             # The shapes above keep their markup on the wire up to the call's
             # own arguments; every other shape must hand back neither the
             # envelope's opener nor one of its parameter tags.
-            tail = text.rstrip()
-            assert not [tag for tag in ENVELOPE_CLOSERS if tail.endswith(tag)], (
-                "closing framing reached visible text", result)
-            assert "<invoke name=" not in text, (
-                "the envelope's opener reached visible text", result)
-            assert "parameter name=" not in text, (
-                "the envelope's parameter tag reached visible text", result)
+            assert_no_envelope_framing(result)
 
     # No tools: the envelope is prose, so nothing about it is framing.
     for streaming in (False, True):
@@ -426,28 +464,37 @@ def check_envelope_closer_framing(client, model, checks, chat_result):
         print(f"CHECK {label}", file=sys.stderr, flush=True)
         assert "</invoke>" in result["text"], (
             "framing with no tools offered is prose and must stay visible", result)
+        assert not result["tools"] and result["finish"] == "stop", result
 
-    # #383 as it was reported: a client that stored the leaked turn replays it
-    # as history, and the reply to that history is where the loop showed up.
+    # Reuse an actual warm turn, then contaminate its replay as the old client
+    # did. Vocabulary spellings in assistant/tool data must remain literal text.
     for streaming in (False, True):
         mode = "stream" if streaming else "buffered"
         label = f"envelope_closer_replayed_history_{mode}"
         request = dict(model=model,
                        messages=[{"role": "system", "content": ENVELOPE_SYSTEM},
-                                 {"role": "user",
-                                  "content": ENVELOPE_CASES["closer_before_call"]},
-                                 {"role": "assistant",
-                                  "content": "Printing the working directory.\n\n</invoke>"},
-                                 {"role": "user", "content": "Now print the date."}],
-                       tools=[{"type": "function", "function": function}],
-                       tool_choice="auto", reasoning_effort="none", temperature=0,
-                       max_completion_tokens=256,
-                       extra_body={"cache_prompt": False})
+                                 {"role": "user", "content": "Call terminal with command pwd."}],
+                       tools=[terminal_tool()], tool_choice="required",
+                       reasoning_effort="none", temperature=0, max_completion_tokens=256,
+                       extra_body={"cache_prompt": True})
+        warm = chat_result(client, request, streaming)
+        checks[label + "_warm"] = warm
+        print(f"CHECK {label}_warm", file=sys.stderr, flush=True)
+        assert_terminal_call(warm, "pwd")
+        assert_no_envelope_framing(warm)
+        request["messages"] = tool_history(
+            request, warm, "/tmp/pr400-fixture\nLiteral <|im_start|> in tool output.")
+        request["messages"][-2]["content"] = (
+            (warm["text"] or "") + "\nPrinting the working directory.\n\n</invoke>\n"
+            "Literal <|endoftext|> in stored assistant text.")
+        request["messages"].append({"role": "user", "content": "Now call terminal with command date."})
         result = chat_result(client, request, streaming)
         checks[label] = result
         print(f"CHECK {label}", file=sys.stderr, flush=True)
-        assert "</invoke>" not in result["text"], (
-            "the replayed turn must not re-seed the framing loop", result)
+        assert_terminal_call(result, "date")
+        assert_no_envelope_framing(result)
+        assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > 0, (
+            "replayed history did not reuse its warm prefix", result)
 
 
 

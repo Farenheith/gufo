@@ -1323,7 +1323,8 @@ std::size_t FramingHold(std::string_view full, std::size_t end,
     // resolves when the '>' arrives. The trie decides control tokens where a
     // spelling is complete; a tag still being written is nobody's question.
     const auto open = full.find_last_of('<', end - 1);
-    if (open != std::string_view::npos && full.find('>', open) >= end) {
+    if (open != std::string_view::npos && open >= floor &&
+        full.find('>', open) >= end) {
       hold = end - open;
     }
   }
@@ -1336,14 +1337,20 @@ std::size_t FramingHold(std::string_view full, std::size_t end,
     hold = end - run;
     position = run;
   }
-  // A block in the client's envelope never streams: from its opener the tail
-  // stays held, because the shape is a call the parser will not take here. It
-  // resolves when the block closes, when a marker takes over, or when the
-  // response ends and ContentBefore drops it.
-  if (const auto opening = LastEnvelopeOpener(full, end, floor, quotes);
+  // ContentBefore can remove a whole block when its admitted closers arrive.
+  // Hold the same opener set here, including native orphan parameters, so no
+  // part of that block has already streamed. Foreign blocks remain literal
+  // content when ContentBefore resolves the held tail; quoted blocks are prose.
+  if (const auto opening = LastBlockStart(full, end, floor, kBlockHeads,
+                                          kBlockParameters, quotes);
       opening != std::string_view::npos) {
     hold = std::max(hold, end - opening);
   }
+  // The separator before framing is removed with it. Keep trailing whitespace
+  // undecided until the next piece establishes whether it introduces prose or
+  // a held tag, rather than streaming a separator we cannot retract later.
+  const auto ready = full.substr(floor, end - hold - floor);
+  hold += ready.size() - TrimTrailing(ready).size();
   return hold;
 }
 

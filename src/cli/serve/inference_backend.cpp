@@ -2669,10 +2669,9 @@ public:
   }
 
   // Adapter from a decoded MTP step to the shared rule: build the run, let the
-  // state resolve it per token. The engine stops on a stop token itself
-  // (`DecodeStep(..., stop_at_eos=true)`), so the ending token is the last one
-  // the step executed: accounted for, never rendered, and the reported history
-  // stays exactly as long as the session's.
+  // state resolve it per token. When the request admits EOS, the engine stops
+  // there too: the ending token is accounted for, never rendered, and the
+  // reported history stays exactly as long as the session's.
   void ResolveStepTokens(QwenFlashNextTextRunnerState& qfn, bool engine_stopped,
                          std::span<const std::int32_t> tokens,
                          TextDecodeStep* step) const {
@@ -2749,12 +2748,10 @@ public:
     std::string error;
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
-    // The engine is told not to stop on a stop token so the runner sees it:
-    // the ending token is executed work, and the reported history has to carry
-    // it and the tokens behind it. The engine stops only for its own reasons
-    // (context exhausted, and so on).
+    // Use the same request policy as SelectNext and the batched MTP path.
+    // ResolveStepTokens accounts for an executed EOS without decoding past it.
     if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
-                                  false)) {
+                                  qfn.stop_at_eos())) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }
@@ -2828,8 +2825,7 @@ public:
           {&session,
            std::min<std::size_t>(decodes[i].max_tokens,
                                  std::uint64_t{max_draft_tokens_} + 1),
-           &sampler, &results[i],
-           /*stop_at_eos=*/true, &outcomes[i]});
+           &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
     }
     std::string error;
     (void)QwenFlashNextSession::DecodeBatch(requests, &error);
