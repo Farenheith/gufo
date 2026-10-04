@@ -45,9 +45,9 @@
 
 namespace gufo::server {
 
-// A selected token ends the turn only when the request asked for end-of-turn
-// detection. Speculative steps admit stop_at_eos=false and report the stop
-// themselves through ResolveDecodedRun, so this stays per-request state.
+// A selected token ends the turn only when the request admits EOS and the token
+// is one of the model's stop tokens. The engine stops there itself and the stop
+// is reported through ResolveDecodedRun, so this stays per-request state.
 template<typename State, typename Tokens>
 bool EndsTurn(const State& state, const Tokens& tokens, int token) {
   return state.stop_at_eos() && tokens.IsStopToken(token);
@@ -2669,10 +2669,10 @@ public:
   }
 
   // Adapter from a decoded MTP step to the shared rule: build the run, let the
-  // state resolve it per token. The engine is told not to stop on a stop token
-  // (`DecodeStep(..., stop_at_eos=false)`) precisely so the rule sees it: the
-  // ending token and the tokens behind it are executed work, and the reported
-  // history has to carry every one of them.
+  // state resolve it per token. The engine stops on a stop token itself
+  // (`DecodeStep(..., stop_at_eos=true)`), so the ending token is the last one
+  // the step executed: accounted for, never rendered, and the reported history
+  // stays exactly as long as the session's.
   void ResolveStepTokens(QwenFlashNextTextRunnerState& qfn, bool engine_stopped,
                          std::span<const std::int32_t> tokens,
                          TextDecodeStep* step) const {
@@ -2829,7 +2829,7 @@ public:
            std::min<std::size_t>(decodes[i].max_tokens,
                                  std::uint64_t{max_draft_tokens_} + 1),
            &sampler, &results[i],
-           /*stop_at_eos=*/false, &outcomes[i]});
+           /*stop_at_eos=*/true, &outcomes[i]});
     }
     std::string error;
     (void)QwenFlashNextSession::DecodeBatch(requests, &error);

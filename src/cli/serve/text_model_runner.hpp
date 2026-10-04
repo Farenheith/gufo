@@ -219,10 +219,9 @@ public:
             .token = decoded.token,
             .piece = {},
         });
-        // One decode runs several tokens, so the engine has already executed
-        // whatever followed the ending one. Those tokens are past the end of
-        // the turn: accounted for, so the history still matches the session,
-        // but never rendered.
+        // A step that admitted EOS can still return tokens past the ending
+        // one. Those are past the end of the turn: accounted for, so the
+        // history still matches the session, but never rendered.
         for (const auto& trailing : run.subspan(index + 1)) {
           selections->push_back({
               .stop = false,
