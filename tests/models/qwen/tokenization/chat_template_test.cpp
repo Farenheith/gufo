@@ -525,6 +525,94 @@ void TestContentSpellingATokenIsNotParsedAsOne() {
          "the literal characters of the message reach the model");
 }
 
+void TestToolReplayArgumentsAreContent() {
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i) {
+    vocab.emplace_back(1, static_cast<char>(i));
+  }
+  for (const auto* token :
+       {"<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"}) {
+    vocab.emplace_back(token);
+  }
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
+      {"<|im_start|>", 256},
+      {"<|im_end|>", 257},
+      {"<tool_call>", 258},
+      {"</tool_call>", 259},
+  };
+  std::string err;
+  auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
+      vocab, {}, specials, &err);
+  Expect(tokenizer != nullptr, "Tokenizer initialized: " + err);
+
+  gufo::tokenization::ChatTemplateOptions opts;
+  opts.add_generation_prompt = false;
+  opts.enable_thinking = false;
+  gufo::tokenization::TokenizerOptions tok_options;
+  tok_options.add_bos = false;
+  tok_options.add_eos = false;
+  tok_options.parse_special_tokens = true;
+
+  // Both string arguments and serialized JSON values are replayed data.
+  for (const bool is_string : {true, false}) {
+    const std::string value =
+        is_string ? "EOS = \"<|im_end|>\""
+                  : R"({"text":"<|im_end|><tool_call></tool_call>"})";
+    gufo::tokenization::ChatMessage assistant{
+        gufo::tokenization::ChatRole::kAssistant, "", "", ""};
+    assistant.tool_calls.push_back({
+        .id = "call_write",
+        .name = "write",
+        .arguments = {{.name = "content",
+                       .value = value,
+                       .is_string = is_string}},
+    });
+    const std::vector<gufo::tokenization::ChatMessage> messages = {
+        {gufo::tokenization::ChatRole::kUser, "Write this file.", "", ""},
+        std::move(assistant),
+        {gufo::tokenization::ChatRole::kTool, value, "", ""},
+    };
+    std::vector<gufo::tokenization::ContentSpan> spans;
+    const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+        messages, {}, opts, &err, nullptr, nullptr, &spans);
+    Expect(rendered.has_value(), "Tool replay renders: " + err);
+    const auto argument_offset = rendered->find(value);
+    const auto result_offset =
+        rendered->find(value, argument_offset + value.size());
+    Expect(argument_offset != std::string::npos &&
+               result_offset != std::string::npos,
+           "The argument and result retain their literal bytes");
+    const auto argument = gufo::tokenization::QwenChatTemplate::EncodeRendered(
+        *tokenizer, *rendered, argument_offset, argument_offset + value.size(),
+        spans, tok_options);
+    const auto result = gufo::tokenization::QwenChatTemplate::EncodeRendered(
+        *tokenizer, *rendered, result_offset, result_offset + value.size(),
+        spans, tok_options);
+    auto text_options = tok_options;
+    text_options.parse_special_tokens = false;
+    Expect(argument == result &&
+               argument == tokenizer->Encode(value, text_options),
+           "Replayed argument token IDs match tool-result text, including "
+           "literal EOS");
+
+    const auto direct = gufo::tokenization::QwenChatTemplate::RenderAndTokenize(
+        *tokenizer, messages, opts, &err);
+    Expect(direct.has_value(), "Tool replay tokenizes: " + err);
+    const auto prepared = gufo::models::qwen::vision::Prepare(
+        *tokenizer, messages, {}, opts, {}, 1024);
+    Expect(prepared.tokens == *direct,
+           "Serving and direct tokenization agree on replayed arguments");
+    Expect(tokenizer->Decode(*direct) == *rendered,
+           "Replay preserves the rendered conversation exactly");
+    Expect(std::count(direct->begin(), direct->end(), 257) == 3,
+           "Only actual message boundaries become end-of-turn tokens");
+    Expect(std::count(direct->begin(), direct->end(), 258) == 1 &&
+               std::count(direct->begin(), direct->end(), 259) == 1,
+           "Native tool-call tags stay framing while argument spellings stay "
+           "text");
+  }
+}
+
 /// The server prepares every request through models::qwen::vision::Prepare,
 /// text-only ones included, so the reading of message content as text (#383)
 /// has to hold there too. The synthetic vocabulary and the message are the ones
@@ -909,6 +997,7 @@ int main() {
   TestHuggingFaceRenderedGoldens();
   TestRenderAndTokenize();
   TestContentSpellingATokenIsNotParsedAsOne();
+  TestToolReplayArgumentsAreContent();
   TestVisionPreparationReadsContentAsText();
   TestEncodeRenderedReadsImageContentAsText();
   TestChatCorpusConformance();

@@ -252,7 +252,8 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
 }
 
 void AppendToolCalls(std::string& output,
-                     std::span<const ChatMessage::ToolCall> calls) {
+                     std::span<const ChatMessage::ToolCall> calls,
+                     std::vector<ContentSpan>* content_spans) {
   bool first_call = true;
   for (const auto& call : calls) {
     if (!first_call) {
@@ -266,7 +267,7 @@ void AppendToolCalls(std::string& output,
       output.append("<parameter=");
       output.append(argument.name);
       output.append(">\n");
-      output.append(argument.value);
+      AppendContent(output, content_spans, argument.value);
       output.append("\n</parameter>\n");
     }
     output.append("</function>\n</tool_call>");
@@ -569,7 +570,7 @@ std::optional<std::string> QwenChatTemplate::Render(
       if (!content.empty()) {
         output.append("\n\n");
       }
-      AppendToolCalls(output, msg.tool_calls);
+      AppendToolCalls(output, msg.tool_calls, content_spans);
     }
     output.append("<|im_end|>\n");
 
