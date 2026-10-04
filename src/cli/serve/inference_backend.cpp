@@ -3156,6 +3156,11 @@ struct InferenceBackend::Impl {
                 const StartCallback& on_start) override {
       auto result = request_.Wait(on_token, on_progress, on_start);
       if (!reasoning_end_.empty()) {
+        // The first closing control token ends reasoning, even one the model
+        // spelled out as an example and even inside a quote. Counting openings
+        // against closings instead reads a reply whose example tags are not
+        // balanced as reasoning and hides its answer, which is worse: the
+        // boundary follows the token, and that stays deliberate.
         const auto end =
             std::search(result.tokens.begin(), result.tokens.end(),
                         reasoning_end_.begin(), reasoning_end_.end());
