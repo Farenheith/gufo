@@ -31,6 +31,7 @@ from tool_native import check_finite_argument_types, check_native_tool_schemas
 from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
                         check_untyped_agent_tools, check_mixed_tool_schemas,
                         check_tool_schema_edges)
+from control_text import check_control_text
 from cache_edits import check_cache_edits
 from cache_concurrency import check_cache_concurrency
 from cache_shared_prefix import check_cache_shared_prefix
@@ -2520,7 +2521,7 @@ def check_server_metrics(client, model, checks, width, context, speculative):
 
 
 SDK_SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "image-count", "structured", "structured-limits",
-              "tool-reasoning", "reasoning-separator",
+              "tool-reasoning", "reasoning-separator", "control-text",
               "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
               "long-context", "state-edges", "progress", "stream-start", "metrics", "cache-edits", "cache-growth", "cache-rotation", "cache-concurrency", "cache-shared-prefix")
 
@@ -2616,6 +2617,8 @@ def main():
                 client, args.model, checks, chat_result, args.sampling_preset),
             "reasoning-separator": lambda: check_reasoning_separator(
                 client, args.model, checks, chat_result),
+            "control-text": lambda: check_control_text(
+                client, args.model, checks, chat_result),
             "tool-agent": lambda: check_tool_agent(
                 client, args.model, checks, chat_result, args.vision, image_content),
             "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),
@@ -2660,6 +2663,7 @@ def main():
                 client, args.model, checks, chat_result),
         }
         selected = ([name for name in suites if name != "tool-native-types"
+                     and name != "control-text"
                      and (name not in ("image-inputs", "image-count") or args.vision)]
                     if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])

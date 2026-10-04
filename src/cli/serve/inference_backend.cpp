@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/control_text.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -2340,6 +2341,7 @@ public:
     session_->SetCancellationCheck({});
     session_->Reset();
     position_ = 0;
+    ClearRewrite();
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
     session_->SetCancellationCheck(check);
@@ -2354,9 +2356,56 @@ public:
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
+  /// Literal tokens a control token rewinds to. A step that cannot commit the
+  /// whole literal leaves the rest queued for the next one.
+  [[nodiscard]] bool has_rewrite() const noexcept {
+    return rewrite_next_ < rewrite_.size();
+  }
+  void BeginRewrite(std::vector<TextRunnerToken> tokens) {
+    rewrite_ = std::move(tokens);
+    rewrite_next_ = 0;
+  }
+  [[nodiscard]] TextRunnerToken TakeRewriteToken() {
+    return rewrite_[rewrite_next_++];
+  }
+  void ClearRewrite() noexcept {
+    rewrite_.clear();
+    rewrite_next_ = 0;
+    rewritten_stop_ = -1;
+    held_.clear();
+  }
+
+  /// Text written out for a refused stop token, held back from the client until
+  /// the model writes again. A reply that stops right after the refused token
+  /// never shows it: that ask was meant to end the turn, not to spell it out.
+  /// The tokens stay in the session either way.
+  [[nodiscard]] const std::string& held_text() const noexcept { return held_; }
+  [[nodiscard]] std::string TakeHeldText() {
+    std::string text = std::move(held_);
+    held_.clear();
+    return text;
+  }
+  void HoldText(std::string_view text) { held_.append(text); }
+  void DropHeldText() noexcept { held_.clear(); }
+
+  /// The stop token just written out as text, while the model has emitted
+  /// nothing else since. A reply that asks to stop twice in a row is finished:
+  /// the second ask ends the turn instead of being written out again.
+  [[nodiscard]] std::int32_t rewritten_stop() const noexcept {
+    return rewritten_stop_;
+  }
+  void SetRewrittenStop(std::int32_t token) noexcept {
+    rewritten_stop_ = token;
+  }
+  void ClearRewrittenStop() noexcept { rewritten_stop_ = -1; }
+
 private:
   std::unique_ptr<QwenFlashNextSession> session_;
   std::size_t position_{0};
+  std::vector<TextRunnerToken> rewrite_;
+  std::size_t rewrite_next_{0};
+  std::int32_t rewritten_stop_{-1};
+  std::string held_;
 };
 
 class QwenFlashNextTextRunnerSnapshot final : public TextRunnerSnapshot {
@@ -2553,6 +2602,9 @@ public:
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
     auto& qfn = RequireQwenFlashNextState(state);
+    // Prefill always precedes the reply, so nothing the model queued can
+    // survive it: a reused state starts the new prompt clean.
+    qfn.ClearRewrite();
     if (offset != qfn.position()) {
       throw std::logic_error(
           "Qwen3.8-Flash-Next prefill offset does not match retained state");
@@ -2579,17 +2631,14 @@ public:
 
   // The engine stops before committing EOS when the request enables it.
   // Every returned token is committed work and is emitted exactly once.
-  void ResolveStepTokens(QwenFlashNextTextRunnerState&, bool engine_stopped,
+  void ResolveStepTokens(QwenFlashNextTextRunnerState& qfn, bool engine_stopped,
                          std::span<const std::int32_t> tokens,
                          TextDecodeStep* step) const {
     step->stop = engine_stopped;
     step->selections.reserve(tokens.size());
     for (const std::int32_t token : tokens) {
-      step->selections.push_back({
-          .stop = false,
-          .token = static_cast<TextRunnerToken>(token),
-          .piece = model_->TokenText(token),
-      });
+      step->selections.push_back(
+          Selection(qfn, static_cast<TextRunnerToken>(token)));
     }
   }
 
@@ -2597,22 +2646,26 @@ public:
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qfn = RequireQwenFlashNextState(state);
     if (qfn.position() >= max_context_) {
+      qfn.DropHeldText();
       return {.stop = true, .piece = {}};
     }
-    const auto logits = qfn.session().Logits();
-    if (logits.empty()) {
-      throw std::runtime_error(
-          "Qwen3.8-Flash-Next token selection has no logits");
+    // Literal text a control token rewound to is committed token by token.
+    if (qfn.has_rewrite()) {
+      return HeldSelection(qfn, qfn.TakeRewriteToken());
     }
-    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    const auto token = SampleNext(qfn, sampler);
+    if (const auto literal = LiteralControlText(qfn, token)) {
+      qfn.BeginRewrite(*literal);
+      qfn.SetRewrittenStop(token);
+      return HeldSelection(qfn, qfn.TakeRewriteToken());
+    }
+    // Whatever else the model emitted retires the previous ask to stop.
+    qfn.ClearRewrittenStop();
     if (EndsTurn(qfn, *model_, token)) {
+      qfn.DropHeldText();
       return {.stop = true, .token = 0, .piece = {}};
     }
-    return {
-        .stop = false,
-        .token = static_cast<TextRunnerToken>(token),
-        .piece = model_->TokenText(token),
-    };
+    return Selection(qfn, static_cast<TextRunnerToken>(token));
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -2631,7 +2684,20 @@ public:
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
-    return SelectNext(state, sampler);
+    // The scheduler compares this token with the first decode step, so the
+    // preview reads state and never writes it.
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (qfn.position() >= max_context_) {
+      return TextDecodeSelection{.stop = true, .token = 0, .piece = {}};
+    }
+    const auto token = SampleNext(qfn, sampler);
+    if (const auto literal = LiteralControlText(qfn, token)) {
+      return PreviewSelection(qfn, literal->front());
+    }
+    if (EndsTurn(qfn, *model_, token)) {
+      return TextDecodeSelection{.stop = true, .token = 0, .piece = {}};
+    }
+    return PreviewSelection(qfn, static_cast<TextRunnerToken>(token));
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -2646,9 +2712,17 @@ public:
     }
     auto& qfn = RequireQwenFlashNextState(state);
     if (qfn.position() >= max_context_) {
+      qfn.DropHeldText();
       return {.selections = {}, .stop = true};
     }
     const auto stats_before = qfn.session().Statistics();
+    // Literal text a control token rewound to needs no model pass: the tokens
+    // are already decided, so they are committed one Evaluate at a time.
+    if (qfn.has_rewrite()) {
+      TextDecodeStep step;
+      CommitRewrite(qfn, max_tokens, &step);
+      return step;
+    }
     sampling::SamplerState working_sampler = sampler;
     QwenFlashNextSession::DecodeResult decoded;
     std::string error;
@@ -2664,8 +2738,27 @@ public:
     // The pool accepts the returned tokens once. Publish the RNG and residual
     // draw so the next batch retains the rejection-conditioned distribution.
     sampler.CopyDrawStateFrom(working_sampler);
+    // A stop with nothing ahead of it directly follows the last emission, so a
+    // repeat of the token just written out means the reply is finished.
+    if (!decoded.tokens.empty()) {
+      qfn.ClearRewrittenStop();
+    }
+    bool stopped = decoded.stop;
+    if (decoded.stop && decoded.stop_token >= 0) {
+      if (const auto literal = LiteralControlText(qfn, decoded.stop_token)) {
+        // The engine refused the token as framing; this reply spells it out.
+        qfn.BeginRewrite(*literal);
+        qfn.SetRewrittenStop(decoded.stop_token);
+        stopped = false;
+      }
+    }
     TextDecodeStep step;
-    ResolveStepTokens(qfn, decoded.stop, decoded.tokens, &step);
+    ResolveStepTokens(qfn, stopped, decoded.tokens, &step);
+    CommitRewrite(qfn, max_tokens, &step);
+    if (stopped) {
+      // The reply ended here, so text held for a refused stop never shows.
+      qfn.DropHeldText();
+    }
     qfn.set_position(qfn.session().Position());
     const auto stats_after = qfn.session().Statistics();
     step.draft_rounds = stats_after.cycles - stats_before.cycles;
@@ -2749,7 +2842,29 @@ public:
       decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
       state.set_position(state.session().Position());
       auto& step = steps[i];
-      ResolveStepTokens(state, results[i].stop, results[i].tokens, &step);
+      // A stop with nothing ahead of it directly follows the last emission.
+      if (!results[i].tokens.empty()) {
+        state.ClearRewrittenStop();
+      }
+      bool stopped = results[i].stop;
+      if (results[i].stop && results[i].stop_token >= 0) {
+        if (const auto literal =
+                LiteralControlText(state, results[i].stop_token)) {
+          // The engine refused the token as framing; this reply spells it out.
+          state.BeginRewrite(*literal);
+          state.SetRewrittenStop(results[i].stop_token);
+          stopped = false;
+        }
+      }
+      ResolveStepTokens(state, stopped, results[i].tokens, &step);
+      CommitRewrite(state,
+                    std::min<std::size_t>(decodes[i].max_tokens,
+                                          std::uint64_t{max_draft_tokens_} + 1),
+                    &step);
+      if (stopped) {
+        // The reply ended here, so text held for a refused stop never shows.
+        state.DropHeldText();
+      }
       if (active_count > 1 && !results[i].tokens.empty()) {
         step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
                                .physical_width = active_count};
@@ -2808,6 +2923,9 @@ public:
                                error);
     }
     restored.set_position(qfn_snapshot->position);
+    // A restored state starts a fresh reply: nothing queued or held survives
+    // it.
+    restored.ClearRewrite();
   }
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
@@ -2871,6 +2989,138 @@ private:
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+
+  /// The text of a token, prefixed with control text a refused stop was
+  /// holding back. Holding nothing — the common case — costs no extra copy.
+  [[nodiscard]] std::string Piece(const std::string& held,
+                                  TextRunnerToken token) const {
+    auto piece = model_->TokenText(static_cast<std::int32_t>(token));
+    if (!held.empty()) {
+      piece.insert(0, held);
+    }
+    return piece;
+  }
+
+  /// A token the model chose: it carries the text of any refused stop token
+  /// that was waiting for the reply to continue.
+  [[nodiscard]] TextDecodeSelection Selection(QwenFlashNextTextRunnerState& qfn,
+                                              TextRunnerToken token) const {
+    if (qfn.held_text().empty()) {
+      return {.stop = false,
+              .token = token,
+              .piece = model_->TokenText(static_cast<std::int32_t>(token))};
+    }
+    const auto held = qfn.TakeHeldText();
+    return {.stop = false, .token = token, .piece = Piece(held, token)};
+  }
+
+  /// A token written out for a refused stop token. Its text waits in the state
+  /// until the model writes again, so a reply that ends here never shows it.
+  [[nodiscard]] TextDecodeSelection HeldSelection(
+      QwenFlashNextTextRunnerState& qfn, TextRunnerToken token) const {
+    qfn.HoldText(model_->TokenText(static_cast<std::int32_t>(token)));
+    return {.stop = false, .token = token, .piece = {}};
+  }
+
+  /// The same selection without taking the waiting text: the scheduler
+  /// publishes the preview, so the preview must not consume it.
+  [[nodiscard]] TextDecodeSelection PreviewSelection(
+      const QwenFlashNextTextRunnerState& qfn, TextRunnerToken token) const {
+    return {
+        .stop = false, .token = token, .piece = Piece(qfn.held_text(), token)};
+  }
+
+  [[nodiscard]] std::int32_t SampleNext(const QwenFlashNextTextRunnerState& qfn,
+                                        sampling::SamplerState& sampler) const {
+    const auto logits = qfn.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "Qwen3.8-Flash-Next token selection has no logits");
+    }
+    return static_cast<std::int32_t>(sampler.Sample(logits));
+  }
+
+  /// Commits queued literal tokens one Evaluate at a time, until the step
+  /// budget is spent. The tokens left over stay queued for the next step.
+  void CommitRewrite(QwenFlashNextTextRunnerState& qfn, std::size_t budget,
+                     TextDecodeStep* step) const {
+    while (step->selections.size() < budget && qfn.has_rewrite()) {
+      const auto token = qfn.TakeRewriteToken();
+      Advance(qfn, token);
+      step->selections.push_back(HeldSelection(qfn, token));
+    }
+  }
+
+  /// Reply text the model produced so far: everything after the last assistant
+  /// framing marker in the session's own history. A restored or forked session
+  /// carries that history, so the reading needs no request state of its own.
+  [[nodiscard]] std::string ReplyText(
+      const QwenFlashNextTextRunnerState& qfn) const {
+    const auto tokens = qfn.session().Tokens();
+    std::size_t begin = 0;
+    if (const auto marker =
+            model_->tokenizer().FindSpecialToken("<|im_start|>")) {
+      for (std::size_t index = tokens.size(); index-- > 0;) {
+        if (static_cast<tokenization::TokenId>(tokens[index]) == *marker) {
+          begin = index + 1;
+          break;
+        }
+      }
+    }
+    if (begin >= tokens.size()) {
+      return {};
+    }
+    return model_->Decode(tokens.subspan(begin));
+  }
+
+  /// Literal tokens for a stop token the model spelled as text, or nothing
+  /// when the token is framing here: outside reasoning and every quote, a stop
+  /// token still ends the turn.
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> LiteralControlText(
+      const QwenFlashNextTextRunnerState& qfn, std::int32_t token) const {
+    // The rewrite exists for the token that would end the turn.
+    if (!qfn.stop_at_eos()) {
+      return std::nullopt;
+    }
+    // Asking twice in a row is how a reply that is finished inside quoting
+    // ends: the first ask was written out, nothing was emitted since.
+    if (token == qfn.rewritten_stop()) {
+      return std::nullopt;
+    }
+    const auto& tokenizer = model_->tokenizer();
+    if (token < 0 ||
+        !tokenizer.IsStopToken(static_cast<tokenization::TokenId>(token))) {
+      return std::nullopt;
+    }
+    // </think> keeps its framing meaning, also inside reasoning or a quote.
+    // The gate above already excludes it; this stays explicit for the wider
+    // every-control-token policy.
+    const auto think_end = tokenizer.FindSpecialToken(kThinkEnd);
+    if (think_end && static_cast<std::int32_t>(*think_end) == token) {
+      return std::nullopt;
+    }
+    if (!ControlTextIsLiteral(ReplyText(qfn))) {
+      return std::nullopt;
+    }
+    const auto text = model_->TokenText(token);
+    if (text.empty()) {
+      return std::nullopt;
+    }
+    tokenization::TokenizerOptions options;
+    options.add_bos = false;
+    options.add_eos = false;
+    options.parse_special_tokens = false;
+    std::vector<TextRunnerToken> literal;
+    for (const auto id : tokenizer.Encode(text, options)) {
+      literal.push_back(id);
+    }
+    // The reply reads back the token it spelled; anything else is not a
+    // rewrite, and the token stays framing.
+    if (literal.empty() || tokenizer.Decode(literal) != text) {
+      return std::nullopt;
+    }
+    return literal;
+  }
 };
 #endif
 

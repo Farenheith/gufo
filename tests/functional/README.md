@@ -82,6 +82,7 @@ draft limit for this suite. Audio and image/video generation have separate tests
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
 | `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
 | `reasoning-separator` | No leading separator newlines after reasoning in Chat/Responses, plain/tools/JSON; exact streamed/buffered text, warm retry, continuation and thinking-off paragraph breaks |
+| `control-text` | Flash-Next only: a stop token the model spells out inside reasoning or an open code span/fence becomes its literal text, and the turn continues to its real end; text written for an ending ask the model does not continue past is dropped, and nothing carries into the next request |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
@@ -113,6 +114,15 @@ For `image-inputs` and `image-count`, pass the model's `--mmproj`. Both use smal
 fixed images and are included in `all` only with that option. `image-count`
 restarts the server for disk replay; its first four cases are 1/16-image timing
 controls usable on older main with `--through-case image-count:image_count_control_16_True`.
+
+`control-text` is Flash-Next only and stays out of `all`; select it explicitly
+for that profile in both of its modes (`off`, `mtp`), which speculate through
+different runners. Run correctness on the candidate and record the pre-fix
+behaviour of the same fixtures with the matching `main` binary as the control:
+before the change the turn ends the moment the token appears, so the sentinel
+and the visible answer are missing. Its fixtures make the model quote the
+end-of-turn token from its own knowledge, and a run that never spells the token
+fails as an unexercised fixture instead of passing.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`

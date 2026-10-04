@@ -691,6 +691,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
   if (is_stop(anchor)) {
     result->stop = true;
+    result->stop_token = anchor;
     return true;
   }
   if (!MtpEnabled() || width < 2) {
@@ -760,8 +761,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const auto anchor = chain.front();
   const auto k = static_cast<std::uint32_t>(chain.size());
   const auto vocab = model_->VocabSize();
+  std::int32_t stop_token = -1;
   const auto is_stop = [&](std::int32_t token) {
-    return request.stop_at_eos && model_->IsStopToken(token);
+    if (!request.stop_at_eos || !model_->IsStopToken(token))
+      return false;
+    stop_token = token;
+    return true;
   };
   if (!pending.speculative) {
     draft_length_.ObserveArToken();
@@ -841,6 +846,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
+  result->stop_token = stop_token;
   if (!exec.Rollback(
           *session_, keep, error_msg,
           gpu_verification && !cpu_rows ? logits_.data() : nullptr)) {

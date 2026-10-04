@@ -84,6 +84,26 @@ public:
            position < std::prev(next)->end;
   }
 
+  /// True when the text ends inside a span that is still open, so the writing
+  /// continues in quoting. A pending delimiter decides as it reads: a run that
+  /// closes the open span ends it, a run with no open span starts one.
+  [[nodiscard]] bool OpenAtEnd() const {
+    const auto end = text_.size();
+    if (fence_size_ > 0) {
+      return !(run_size_ >= fence_size_ && run_char_ == fence_char_ &&
+               AtLineStart(run_begin_));
+    }
+    if (inline_size_ > 0) {
+      return !(run_char_ == '`' && run_size_ == inline_size_ &&
+               run_begin_ + run_size_ == end);
+    }
+    if (run_size_ == 0 || run_begin_ + run_size_ != end)
+      return false;
+    if (run_char_ == '`')
+      return true;
+    return run_size_ >= 3 && AtLineStart(run_begin_);
+  }
+
   [[nodiscard]] std::size_t bytes_scanned() const noexcept {
     return bytes_scanned_;
   }

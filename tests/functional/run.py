@@ -29,7 +29,7 @@ from metrics import compare, comparison_status, join_server_timings, timing_meas
 
 TESTS = Path(__file__).resolve().parent
 SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "image-count", "structured", "structured-limits",
-          "tool-reasoning", "reasoning-separator",
+          "tool-reasoning", "reasoning-separator", "control-text",
           "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
           "long-context", "state-edges", "progress", "stream-start", "metrics", "cache-edits", "cache-growth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache")
 SAMPLING = {
@@ -246,7 +246,7 @@ def main():
     if "all" in selected:
         if len(selected) != 1:
             parser.error("all cannot be combined with other suites")
-        selected = [suite for suite in SUITES if suite not in ("auto-tools", "tool-native-types")
+        selected = [suite for suite in SUITES if suite not in ("auto-tools", "tool-native-types", "control-text")
                     and (suite not in ("image-inputs", "image-count")
                          or option(command, "--mmproj") is not None)]
     selected = list(dict.fromkeys(selected))

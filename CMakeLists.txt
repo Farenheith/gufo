@@ -387,6 +387,11 @@ if (BUILD_TESTING)
   add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
   set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
 
+  add_executable(control_text_test tests/cli/control_text_test.cpp)
+  target_link_libraries(control_text_test PRIVATE gufo_core)
+  add_test(NAME control_text_test COMMAND control_text_test)
+  set_tests_properties(control_text_test PROPERTIES LABELS "cpu;server;api")
+
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)

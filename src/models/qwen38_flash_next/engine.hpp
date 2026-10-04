@@ -131,6 +131,9 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    /// Stop token the engine refused to commit, or -1 when the step did not
+    /// stop. Serving decides whether the model spelled the token as text.
+    std::int32_t stop_token{-1};
   };
   /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
   /// compact MTP proposals and uses target/draft rejection with a residual
