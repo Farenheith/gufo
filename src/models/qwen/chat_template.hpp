@@ -202,6 +202,17 @@ public:
       std::span<const ChatTool> tools, const ChatTemplateOptions& options = {},
       std::string* error_msg = nullptr);
 
+  /// The rendered prompt's bytes from `begin` to `end` as tokens: message
+  /// content is read as text and everything else as framing (#383), so a
+  /// control token a client spelled stays the characters it wrote. `begin` must
+  /// fall on a token boundary. A slice that spells no vocabulary token gets the
+  /// plain framing reading, which is what ordinary prompts get.
+  [[nodiscard]] static std::vector<TokenId> EncodeRendered(
+      const QwenTokenizer& tokenizer, std::string_view rendered,
+      std::size_t begin, std::size_t end,
+      std::span<const ContentSpan> content_spans,
+      const TokenizerOptions& options);
+
 private:
   QwenChatTemplate(std::string template_str, std::string template_sha256,
                    Profile profile)

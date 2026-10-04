@@ -88,7 +88,6 @@ public:
   /// Length of the longest spelling, or zero when the vocabulary lists none.
   [[nodiscard]] std::size_t LongestSpelling() const { return longest_; }
 
-
 private:
   /// Characters a token name may contain: '<' and '|' are delimiters, so an
   /// indexed spelling never carries one and a failed walk can restart only at

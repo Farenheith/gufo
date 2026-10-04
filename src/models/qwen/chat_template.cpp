@@ -595,6 +595,68 @@ std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
   return RenderAndTokenize(tokenizer, messages, {}, options, error_msg);
 }
 
+std::vector<TokenId> QwenChatTemplate::EncodeRendered(
+    const QwenTokenizer& tokenizer, std::string_view rendered,
+    std::size_t begin, std::size_t end,
+    std::span<const ContentSpan> content_spans,
+    const TokenizerOptions& options) {
+  const auto slice = rendered.substr(begin, end - begin);
+  // Content is text. Only text that spells a vocabulary token needs the
+  // stricter reading, so ordinary prompts tokenize exactly as before and the
+  // rare hazardous one keeps its literal characters out of control-token
+  // parsing: the span is read as text, the framing around it as framing.
+  const bool spells_token = std::any_of(
+      content_spans.begin(), content_spans.end(), [&](const ContentSpan& span) {
+        const auto span_end = span.offset + span.size;
+        if (span_end <= begin || span.offset >= end) {
+          return false;
+        }
+        const auto from = std::max(span.offset, begin) - begin;
+        const auto to = std::min(span_end, end) - begin;
+        const auto text = slice.substr(from, to - from);
+        return std::any_of(
+            tokenizer.SpecialTokens().begin(), tokenizer.SpecialTokens().end(),
+            [&](const auto& token) {
+              return text.find(token.first) != std::string_view::npos;
+            });
+      });
+  if (!spells_token) {
+    return tokenizer.Encode(slice, options);
+  }
+
+  TokenizerOptions as_framing = options;
+  as_framing.parse_special_tokens = true;
+  TokenizerOptions as_content = options;
+  as_content.parse_special_tokens = false;
+  const auto encode = [&](std::size_t from, std::size_t to,
+                          const TokenizerOptions& opts) {
+    return tokenizer.Encode(rendered.substr(from, to - from), opts);
+  };
+
+  std::vector<TokenId> tokens;
+  std::size_t cursor = begin;
+  for (const auto& span : content_spans) {
+    const auto span_end = span.offset + span.size;
+    if (span_end <= begin || span.offset >= end) {
+      continue;
+    }
+    const auto from = std::max(span.offset, begin);
+    const auto to = std::min(span_end, end);
+    if (from > cursor) {
+      const auto framing = encode(cursor, from, as_framing);
+      tokens.insert(tokens.end(), framing.begin(), framing.end());
+    }
+    const auto content = encode(from, to, as_content);
+    tokens.insert(tokens.end(), content.begin(), content.end());
+    cursor = to;
+  }
+  if (cursor < end) {
+    const auto tail = encode(cursor, end, as_framing);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+  }
+  return tokens;
+}
+
 std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
     const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
     std::span<const ChatTool> tools, const ChatTemplateOptions& options,
@@ -619,46 +681,8 @@ std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
   tok_opts.add_bos = false;
   tok_opts.add_eos = false;
   tok_opts.parse_special_tokens = true;
-
-  // Content is text. Only text that spells a vocabulary token needs the
-  // stricter reading, so ordinary prompts tokenize exactly as before and the
-  // rare hazardous one keeps its literal characters out of control-token
-  // parsing: the span is read as text, the framing around it as framing.
-  const std::string_view prompt = *rendered;
-  const bool content_spells_token = std::any_of(
-      content_spans.begin(), content_spans.end(), [&](const ContentSpan& span) {
-        const auto text = prompt.substr(span.offset, span.size);
-        return std::any_of(
-            tokenizer.SpecialTokens().begin(), tokenizer.SpecialTokens().end(),
-            [&](const auto& token) {
-              return text.find(token.first) != std::string_view::npos;
-            });
-      });
-  if (!content_spells_token) {
-    return tokenizer.Encode(*rendered, tok_opts);
-  }
-
-  std::vector<TokenId> tokens;
-  std::size_t cursor = 0;
-  for (const auto& span : content_spans) {
-    if (span.offset > cursor) {
-      tok_opts.parse_special_tokens = true;
-      const auto framing = tokenizer.Encode(
-          prompt.substr(cursor, span.offset - cursor), tok_opts);
-      tokens.insert(tokens.end(), framing.begin(), framing.end());
-    }
-    tok_opts.parse_special_tokens = false;
-    const auto content =
-        tokenizer.Encode(prompt.substr(span.offset, span.size), tok_opts);
-    tokens.insert(tokens.end(), content.begin(), content.end());
-    cursor = span.offset + span.size;
-  }
-  if (cursor < prompt.size()) {
-    tok_opts.parse_special_tokens = true;
-    const auto tail = tokenizer.Encode(prompt.substr(cursor), tok_opts);
-    tokens.insert(tokens.end(), tail.begin(), tail.end());
-  }
-  return tokens;
+  return EncodeRendered(tokenizer, *rendered, 0, rendered->size(),
+                        content_spans, tok_opts);
 }
 
 }  // namespace gufo::tokenization

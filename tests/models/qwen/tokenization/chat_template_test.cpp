@@ -16,6 +16,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen/vision/prompt.hpp"
 #include "tests/models/chat_template_golden_helpers.hpp"
 
 namespace {
@@ -524,6 +525,149 @@ void TestContentSpellingATokenIsNotParsedAsOne() {
          "the literal characters of the message reach the model");
 }
 
+/// The server prepares every request through models::qwen::vision::Prepare,
+/// text-only ones included, so the reading of message content as text (#383)
+/// has to hold there too. The synthetic vocabulary and the message are the ones
+/// the template test above uses: the same conversation must tokenize the same
+/// way whichever entry point reads it.
+void TestVisionPreparationReadsContentAsText() {
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i) {
+    vocab.emplace_back(1, static_cast<char>(i));
+  }
+  vocab.emplace_back("<|im_start|>");
+  vocab.emplace_back("<|im_end|>");
+  vocab.emplace_back("<think>");
+  vocab.emplace_back("</think>");
+  vocab.emplace_back("<|endoftext|>");
+
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
+      {"<|im_start|>", 256}, {"<|im_end|>", 257},    {"<think>", 258},
+      {"</think>", 259},     {"<|endoftext|>", 260},
+  };
+
+  std::string err;
+  auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
+      vocab, {}, specials, &err);
+  Expect(tokenizer != nullptr, "Tokenizer initialized: " + err);
+
+  const std::string text = "Literal <|endoftext|> text";
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, text, "", ""},
+  };
+  gufo::tokenization::ChatTemplateOptions opts;
+  opts.enable_thinking = false;
+
+  const auto injected = tokenizer->FindSpecialToken("<|endoftext|>");
+  Expect(injected.has_value(), "the message token is a vocabulary token");
+
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
+  const auto direct = tpl->RenderAndTokenize(*tokenizer, messages, opts, &err);
+  Expect(direct.has_value(), "RenderAndTokenize succeeds: " + err);
+  Expect(std::find(direct->begin(), direct->end(), *injected) == direct->end(),
+         "the template path does not inject the control token");
+
+  // No images, which is the common case: the serving path still goes through
+  // the vision preparation, and it must read the message as text as well.
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, opts, {}, 512);
+  Expect(std::find(prepared.tokens.begin(), prepared.tokens.end(), *injected) ==
+             prepared.tokens.end(),
+         "vision::Prepare does not inject a control token a message spelled");
+  Expect(!prepared.tokens.empty() &&
+             tokenizer->Decode(prepared.tokens).find(text) != std::string::npos,
+         "the literal characters of the message reach the model");
+
+  const auto framing = tokenizer->FindSpecialToken("<|im_start|>");
+  Expect(framing.has_value() &&
+             std::find(prepared.tokens.begin(), prepared.tokens.end(),
+                       *framing) != prepared.tokens.end(),
+         "template framing still tokenizes as control tokens");
+}
+
+/// A picture in the message changes the framing the prompt is built from, and
+/// the content around it still reads as text. The preparation walks an
+/// image-bearing prompt in slices, so the helper is asked here with those same
+/// boundaries, image placeholders included. Decoding the picture itself needs
+/// the model's projector, which this test has no reason to carry: the
+/// image-inputs functional suite covers that path end to end.
+void TestEncodeRenderedReadsImageContentAsText() {
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i) {
+    vocab.emplace_back(1, static_cast<char>(i));
+  }
+  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<think>", "</think>",
+                            "<|endoftext|>", "<|image_pad|>"}) {
+    vocab.emplace_back(token);
+  }
+
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
+      {"<|im_start|>", 256}, {"<|im_end|>", 257},    {"<think>", 258},
+      {"</think>", 259},     {"<|endoftext|>", 260}, {"<|image_pad|>", 261},
+  };
+
+  std::string err;
+  auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
+      vocab, {}, specials, &err);
+  Expect(tokenizer != nullptr, "Tokenizer initialized: " + err);
+
+  const std::string text = "Literal <|endoftext|> text";
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, text, "", ""},
+  };
+  // Rendering only, so the placeholder is enough: nothing decodes these bytes.
+  messages.back().images.push_back(
+      {0, std::make_shared<const std::vector<std::uint8_t>>(1, 0)});
+  gufo::tokenization::ChatTemplateOptions opts;
+  opts.enable_thinking = false;
+
+  const auto injected = tokenizer->FindSpecialToken("<|endoftext|>");
+  const auto framing = tokenizer->FindSpecialToken("<|im_start|>");
+  Expect(injected.has_value() && framing.has_value(),
+         "the message and framing tokens are vocabulary tokens");
+
+  std::vector<std::size_t> offsets;
+  std::vector<gufo::tokenization::ContentSpan> spans;
+  const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+      messages, {}, opts, &err, &offsets, nullptr, &spans);
+  Expect(rendered.has_value(), "an image-bearing prompt renders: " + err);
+  Expect(offsets.size() == 1 &&
+             rendered->substr(offsets[0],
+                              std::string_view("<|image_pad|>").size()) ==
+                 "<|image_pad|>",
+         "the picture becomes an image placeholder");
+
+  gufo::tokenization::TokenizerOptions tok_options;
+  tok_options.add_bos = false;
+  tok_options.add_eos = false;
+  tok_options.parse_special_tokens = true;
+  const auto encode = [&](std::size_t begin, std::size_t end) {
+    return gufo::tokenization::QwenChatTemplate::EncodeRendered(
+        *tokenizer, *rendered, begin, end, spans, tok_options);
+  };
+  const auto whole = encode(0, rendered->size());
+  const auto up_to_image = encode(0, offsets[0]);
+  const auto after_image = encode(offsets[0] + 13, rendered->size());
+  const auto count = [&](const std::vector<gufo::tokenization::TokenId>& ids) {
+    return std::count(ids.begin(), ids.end(), *injected);
+  };
+  std::cout << "  image-bearing prompt: " << rendered->size() << " bytes, "
+            << whole.size() << " tokens whole, " << up_to_image.size()
+            << " before the picture, " << after_image.size()
+            << " after; injected " << count(whole) << "/" << count(up_to_image)
+            << "/" << count(after_image) << "\n";
+
+  Expect(
+      count(whole) == 0 && count(up_to_image) == 0 && count(after_image) == 0,
+      "no slice of an image-bearing prompt injects a token the message "
+      "spelled");
+  Expect(std::find(whole.begin(), whole.end(), *framing) != whole.end(),
+         "template framing still tokenizes as control tokens with a picture");
+  Expect(
+      tokenizer->Decode(whole).find(text) != std::string::npos,
+      "the literal characters of the message reach the model with a picture");
+}
+
 void TestChatCorpusConformance() {
   auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
@@ -765,6 +909,8 @@ int main() {
   TestHuggingFaceRenderedGoldens();
   TestRenderAndTokenize();
   TestContentSpellingATokenIsNotParsedAsOne();
+  TestVisionPreparationReadsContentAsText();
+  TestEncodeRenderedReadsImageContentAsText();
   TestChatCorpusConformance();
   TestToolRendering();
   TestToolReplayPreservesGeneratedPrefix();
