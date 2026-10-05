@@ -772,6 +772,96 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
             << std::flush;
 }
 
+/// A batched MTP step must not run the engine for a participant that still
+/// holds literal rewrite tokens. The engine reads each session's committed
+/// history, so such a participant would generate from a context missing the
+/// queued tokens and emit its fresh tokens ahead of them. The scalar path
+/// commits the pending literal and returns without a model pass; the batched
+/// path must agree with it token for token.
+///
+/// A one-token draft chain caps a step at two committed tokens, so the literal
+/// text of a stop token the model spells out inside its reasoning crosses the
+/// step boundary and stays queued. Without that budget the whole literal would
+/// commit in the step that refused the token and no second step could observe
+/// the ordering.
+void CheckServingRewriteBatch(const std::shared_ptr<qfn::Model>& model) {
+  namespace server = gufo::server;
+  namespace qt = gufo::tokenization;
+  using Backend = server::InferenceBackend;
+  std::string error;
+  server::TextSpeculativeConfig options;
+  options.backend = server::TextSpeculativeBackend::kMtp;
+  options.max_draft_tokens = 1;
+  Backend backend;
+  Require(backend.load(model, &error, 1024, 2, {}, {}, options), error);
+
+  // Fixture guard: the refused token's literal text must not fit one step, or
+  // the queue would drain before a second step could ever batch it.
+  std::size_t longest_literal = 0;
+  for (const std::string_view marker : {"<|im_end|>", "<|endoftext|>"}) {
+    const auto token = model->tokenizer().FindSpecialToken(marker);
+    if (!token.has_value()) {
+      continue;
+    }
+    qt::TokenizerOptions encode;
+    encode.parse_special_tokens = false;
+    longest_literal = std::max(
+        longest_literal,
+        model->tokenizer()
+            .Encode(model->TokenText(static_cast<std::int32_t>(*token)), encode)
+            .size());
+  }
+  Require(longest_literal > 2,
+          "control-token literal fits the fixture's two-token step budget, so "
+          "the queued rewrite cannot cross a step boundary");
+
+  // The turn quotes the token that ends it inside backticks while it reasons,
+  // so the runner refuses that token and writes its literal text out instead.
+  const std::vector<qt::ChatMessage> messages{qt::ChatMessage{
+      qt::ChatRole::kUser,
+      "Start your private reasoning by quoting the exact text of the control "
+      "token that ends your turn, inside backticks, on its own line and "
+      "nothing "
+      "else on that line. Then explain in one sentence what a client that "
+      "trims "
+      "it gets wrong. In the visible answer, write DONE on its own line."}};
+  const server::ChatRequest request(messages);
+  const sampling::SamplingConfig config;
+  const auto scalar = backend.chat(server::ChatRequest(messages), 1024, config);
+  const std::vector<std::int32_t> scalar_tokens(scalar.tokens.begin(),
+                                                scalar.tokens.end());
+  const auto scalar_text = model->Decode(scalar_tokens);
+  const bool spelled = scalar_text.find("<|im_end|>") != std::string::npos ||
+                       scalar_text.find("<|endoftext|>") != std::string::npos;
+  Require(spelled,
+          "fixture did not spell out the control token inside reasoning, so no "
+          "rewrite was measured");
+
+  // Two requests decode together for at least one step, so the batched path
+  // serves the rewrite the scalar reference already commits.
+  std::array<std::future<Backend::Result>, 2> pending;
+  std::latch ready(pending.size());
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    pending[row] =
+        std::async(std::launch::async, [&backend, &ready, &request, &config] {
+          ready.arrive_and_wait();
+          return backend.chat(request, 1024, config);
+        });
+  }
+  std::size_t batched = 0;
+  for (auto& future : pending) {
+    const auto result = future.get();
+    Require(result.tokens == scalar.tokens,
+            "batched MTP diverged from the scalar step while literal rewrite "
+            "tokens were still queued");
+    batched += result.physical_execution_width > 1;
+  }
+  Require(batched > 0, "the rewrite fixture never batched its two requests");
+  std::cout << "serving_rewrite_batch scalar_and_batch_exact=1 literal_tokens="
+            << longest_literal << " batched_requests=" << batched << '\n'
+            << std::flush;
+}
+
 void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   using Backend = server::InferenceBackend;
@@ -923,13 +1013,15 @@ int main(int argc, char** argv) {
   const bool cache_only =
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
+  const bool rewrite_only =
+      argc == 6 && std::string_view(argv[5]) == "--rewrite-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only) ||
+       !cache_only && !eos_only && !rewrite_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
                  "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only]\n";
+                 "--cache-only | --eos-only | --rewrite-only]\n";
     return 77;
   }
   try {
@@ -941,6 +1033,10 @@ int main(int argc, char** argv) {
     Require(model != nullptr, error);
     if (eos_only) {
       CheckServingEos(model);
+      return 0;
+    }
+    if (rewrite_only) {
+      CheckServingRewriteBatch(model);
       return 0;
     }
     if (cache_only) {

@@ -2807,72 +2807,109 @@ public:
       return TextModelRunner::DecodeBatch(decodes);
     }
     const auto count = decodes.size();
+    std::vector<TextDecodeStep> steps(count);
+    // Literal tokens a previous step left queued commit before their session
+    // may join the engine batch. DecodeStep returns on that commit alone, and
+    // the batched engine reads every session's committed history: a session
+    // still missing the queued tokens would generate from the wrong context and
+    // emit its fresh tokens ahead of them. Only participants with nothing
+    // queued batch.
+    std::vector<std::size_t> batched;
+    batched.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+      auto& state = RequireQwenFlashNextState(decodes[index].state.get());
+      if (state.has_rewrite()) {
+        CommitRewrite(state, decodes[index].max_tokens, &steps[index]);
+      } else {
+        batched.push_back(index);
+      }
+    }
+    if (batched.empty()) {
+      return steps;
+    }
+    // Fewer than two participants are left, so there is no batch to run: the
+    // scalar path serves them exactly as it serves a lone request.
+    if (batched.size() < 2) {
+      for (const auto index : batched) {
+        try {
+          steps[index] =
+              DecodeStep(decodes[index].state.get(), decodes[index].max_tokens,
+                         decodes[index].sampler.get());
+        } catch (...) {
+          steps[index].failure = std::current_exception();
+        }
+      }
+      return steps;
+    }
+    const auto batched_count = batched.size();
     std::vector<sampling::SamplerState> samplers;
-    std::vector<QwenFlashNextSession::DecodeResult> results(count);
-    std::vector<QwenFlashNextSession::BatchOutcome> outcomes(count);
+    std::vector<QwenFlashNextSession::DecodeResult> results(batched_count);
+    std::vector<QwenFlashNextSession::BatchOutcome> outcomes(batched_count);
     std::vector<QwenFlashNextSession::SpeculativeStats> before;
     std::vector<QwenFlashNextSession::DecodeRequest> requests;
-    samplers.reserve(count);
-    before.reserve(count);
-    requests.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      auto& state = RequireQwenFlashNextState(decodes[i].state.get());
+    samplers.reserve(batched_count);
+    before.reserve(batched_count);
+    requests.reserve(batched_count);
+    for (std::size_t slot = 0; slot < batched_count; ++slot) {
+      const auto& decode = decodes[batched[slot]];
+      auto& state = RequireQwenFlashNextState(decode.state.get());
       auto& session = state.session();
-      auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
+      auto& sampler = samplers.emplace_back(decode.sampler.get());
       before.push_back(session.Statistics());
       requests.push_back(
           {&session,
-           std::min<std::size_t>(decodes[i].max_tokens,
+           std::min<std::size_t>(decode.max_tokens,
                                  std::uint64_t{max_draft_tokens_} + 1),
-           &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
+           &sampler, &results[slot], state.stop_at_eos(), &outcomes[slot]});
     }
     std::string error;
     (void)QwenFlashNextSession::DecodeBatch(requests, &error);
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
-    std::vector<TextDecodeStep> steps(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      if (!outcomes[i].completed) {
-        steps[i].failure = std::make_exception_ptr(
-            std::runtime_error("Flash-Next MTP failed: " + outcomes[i].error));
+    for (std::size_t slot = 0; slot < batched_count; ++slot) {
+      const auto index = batched[slot];
+      const auto& decode = decodes[index];
+      if (!outcomes[slot].completed) {
+        steps[index].failure = std::make_exception_ptr(std::runtime_error(
+            "Flash-Next MTP failed: " + outcomes[slot].error));
         continue;
       }
-      auto& state = RequireQwenFlashNextState(decodes[i].state.get());
-      decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
+      auto& state = RequireQwenFlashNextState(decode.state.get());
+      decode.sampler.get().CopyDrawStateFrom(samplers[slot]);
       state.set_position(state.session().Position());
-      auto& step = steps[i];
+      auto& step = steps[index];
       // A stop with nothing ahead of it directly follows the last emission.
-      if (!results[i].tokens.empty()) {
+      if (!results[slot].tokens.empty()) {
         state.ClearRewrittenStop();
       }
-      bool stopped = results[i].stop;
-      if (results[i].stop && results[i].stop_token >= 0) {
+      bool stopped = results[slot].stop;
+      if (results[slot].stop && results[slot].stop_token >= 0) {
         if (const auto literal =
-                LiteralControlText(state, results[i].stop_token)) {
+                LiteralControlText(state, results[slot].stop_token)) {
           // The engine refused the token as framing; this reply spells it out.
           state.BeginRewrite(*literal);
-          state.SetRewrittenStop(results[i].stop_token);
+          state.SetRewrittenStop(results[slot].stop_token);
           stopped = false;
         }
       }
-      ResolveStepTokens(state, stopped, results[i].tokens, &step);
+      ResolveStepTokens(state, stopped, results[slot].tokens, &step);
       CommitRewrite(state,
-                    std::min<std::size_t>(decodes[i].max_tokens,
+                    std::min<std::size_t>(decode.max_tokens,
                                           std::uint64_t{max_draft_tokens_} + 1),
                     &step);
       if (stopped) {
         // The reply ended here, so text held for a refused stop never shows.
         state.DropHeldText();
       }
-      if (active_count > 1 && !results[i].tokens.empty()) {
+      if (active_count > 1 && !results[slot].tokens.empty()) {
         step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
                                .physical_width = active_count};
       }
       const auto stats = state.session().Statistics();
-      step.draft_rounds = stats.cycles - before[i].cycles;
-      step.draft_tokens = stats.drafted - before[i].drafted;
-      step.draft_accepted_tokens = stats.accepted - before[i].accepted;
+      step.draft_rounds = stats.cycles - before[slot].cycles;
+      step.draft_tokens = stats.drafted - before[slot].drafted;
+      step.draft_accepted_tokens = stats.accepted - before[slot].accepted;
     }
     return steps;
   }
