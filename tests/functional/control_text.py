@@ -1,15 +1,22 @@
 """Stop tokens the model spells out inside reasoning or a quoted span.
 
-Flash-Next only. The model ends its turn with a control token that the runner
-refuses while the reply is inside reasoning or inside an open code span or
-fence; those turns commit the token's literal text instead and keep writing.
-That text reaches the client only once the reply continues: a reply that asks
-to stop again immediately ends with its answer and without the text.
-The fixtures below force the model to name that token, so the boundary is
-exercised with the turn's real end still ahead of it: a turn cut by the token
-stops as soon as it appears and never reaches the DONE sentinel. Both stop
-tokens are covered, a fence the model leaves open counts as a quote, and
-nothing written for a refused stop survives into the next request.
+Flash-Next only, and opt-in behind the server's ``--experimental-control-text``.
+The model ends its turn with a control token that the runner refuses while the
+reply is inside reasoning or inside an open code span or fence; those turns
+commit the token's literal text instead and keep writing. That text reaches the
+client only once the reply continues: a reply that asks to stop again immediately
+ends with its answer and without the text.
+
+Both arms of the flag are checked against the same fixtures, so the same binary
+supplies the qualification and its control. With the flag the fixtures below
+force the model to name that token, so the boundary is exercised with the turn's
+real end still ahead of it: a turn cut by the token stops as soon as it appears
+and never reaches the DONE sentinel. Without the flag the token must end the
+turn where it appears, which is the pre-feature behaviour: nothing is written
+for it, and the visible answer is never reached.
+
+Both stop tokens are covered, a fence the model leaves open counts as a quote,
+and nothing written for a refused stop survives into the next request.
 """
 
 import sys
@@ -88,8 +95,24 @@ def assert_no_trailing_marker(result, where):
         result)
 
 
-def check_control_text(client, model, checks, chat_result):
-    """Stop tokens inside reasoning or a quote become text; the turn continues."""
+def assert_consumed(result, where):
+    """The token ended the turn where it appears, the pre-feature outcome.
+
+    Nothing is written out for it and the visible answer the prompt asks for is
+    never reached. A turn that merely avoided the token would answer and carry
+    DONE, so an unexercised fixture fails here instead of passing quietly.
+    """
+    assert result["finish"] == "stop", result
+    assert named_marker(result) is None, (
+        f"a control token reached the client {where} with the behaviour off: the "
+        f"reply wrote it out instead of ending the turn there", result)
+    assert "DONE" not in result["text"], (
+        f"the turn reached its visible answer {where} with the behaviour off, so "
+        f"the token did not end it", result)
+
+
+def check_control_text(client, model, checks, chat_result, control_text="on"):
+    """Assert the arm the server was started with; the fixtures are shared."""
 
     def run(name, prompt, thinking, streaming=False, previous=None, cache_prompt=False):
         messages = list(previous or []) + [{"role": "user", "content": prompt}]
@@ -103,6 +126,15 @@ def check_control_text(client, model, checks, chat_result):
         checks[name] = result
         print(f"CHECK {name}", file=sys.stderr, flush=True)
         return result
+
+    if control_text == "off":
+        check_control_text_off(run)
+    else:
+        check_control_text_on(run)
+
+
+def check_control_text_on(run):
+    """Stop tokens inside reasoning or a quote become text; the turn continues."""
 
     reasoning = run("control_text_reasoning", REASONING_PROMPT, True)
     assert_named_marker(reasoning, "in reasoning")
@@ -158,6 +190,32 @@ def check_control_text(client, model, checks, chat_result):
     # The reasoning-end marker keeps its framing meaning: a turn that cannot
     # close its reasoning block never reaches its answer.
     unrelated = run("control_text_reasoning_end", UNRELATED_PROMPT, True)
+    assert len(unrelated["reasoning"]) > 12, unrelated
+    assert "ANSWER" in unrelated["text"] and "391" in unrelated["text"], unrelated
+    assert unrelated["finish"] == "stop", unrelated
+
+
+def check_control_text_off(run):
+    """The same fixtures without the flag: the token ends the turn, as before."""
+
+    reasoning = run("control_text_off_reasoning", REASONING_PROMPT, True)
+    assert_consumed(reasoning, "in reasoning")
+
+    streamed = run("control_text_off_reasoning_stream", REASONING_PROMPT, True, True)
+    assert_consumed(streamed, "in streamed reasoning")
+
+    quote = run("control_text_off_quote", QUOTE_PROMPT, False)
+    assert_consumed(quote, "in a backtick span")
+
+    fence = run("control_text_off_fence", FENCE_PROMPT, False)
+    assert_consumed(fence, "in a fenced block")
+
+    end_of_text = run("control_text_off_endoftext", END_OF_TEXT_PROMPT, False)
+    assert_consumed(end_of_text, "naming the pretraining end token")
+
+    # The reasoning-end marker keeps its framing meaning either way: this turn
+    # never meets a stop token it spells out, so it still reaches its answer.
+    unrelated = run("control_text_off_reasoning_end", UNRELATED_PROMPT, True)
     assert len(unrelated["reasoning"]) > 12, unrelated
     assert "ANSWER" in unrelated["text"] and "391" in unrelated["text"], unrelated
     assert unrelated["finish"] == "stop", unrelated

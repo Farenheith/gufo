@@ -59,13 +59,11 @@ public:
     if (fence_size_ > 0) {
       if (closing_fence_ && position >= fence_begin_ && position < close_begin_)
         return true;
-      if (run_size_ >= fence_size_ && run_char_ == fence_char_ &&
-          AtLineStart(run_begin_) && position >= fence_begin_ &&
+      if (PendingRunClosesFence() && position >= fence_begin_ &&
           position < run_begin_)
         return true;
-    } else if (inline_size_ > 0 && run_char_ == '`' &&
-               run_size_ == inline_size_ && position >= inline_begin_ &&
-               position < run_begin_) {
+    } else if (inline_size_ > 0 && PendingRunClosesInline() &&
+               position >= inline_begin_ && position < run_begin_) {
       return true;
     }
     return false;
@@ -90,12 +88,10 @@ public:
   [[nodiscard]] bool OpenAtEnd() const {
     const auto end = text_.size();
     if (fence_size_ > 0) {
-      return !(run_size_ >= fence_size_ && run_char_ == fence_char_ &&
-               AtLineStart(run_begin_));
+      return !PendingRunClosesFence();
     }
     if (inline_size_ > 0) {
-      return !(run_char_ == '`' && run_size_ == inline_size_ &&
-               run_begin_ + run_size_ == end);
+      return !(PendingRunClosesInline() && run_begin_ + run_size_ == end);
     }
     if (run_size_ == 0 || run_begin_ + run_size_ != end)
       return false;
@@ -116,6 +112,17 @@ private:
 
   [[nodiscard]] bool AtLineStart(std::size_t position) const {
     return first_nonblank_ == position;
+  }
+
+  /// A pending delimiter run that closes the span it sits in. Both readers ask
+  /// this rather than re-deriving it, so the provisional-tail rule lives once.
+  [[nodiscard]] bool PendingRunClosesFence() const {
+    return run_size_ >= fence_size_ && run_char_ == fence_char_ &&
+           AtLineStart(run_begin_);
+  }
+
+  [[nodiscard]] bool PendingRunClosesInline() const {
+    return run_char_ == '`' && run_size_ == inline_size_;
   }
 
   void FlushRun() {

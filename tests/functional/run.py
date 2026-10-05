@@ -80,6 +80,36 @@ def option(command, name, default=None):
     return values[0] if values else default
 
 
+CONTROL_TEXT_FLAG = "--experimental-control-text"
+
+
+def control_text_arm(command):
+    """The behaviour the control-text suite must expect from this server.
+
+    With the flag the token is written out and the turn continues; without it
+    the token ends the turn, which is the pre-feature path. A switch takes no
+    value, so its presence is the whole test and it may sit anywhere.
+    """
+    return "on" if CONTROL_TEXT_FLAG in command else "off"
+
+
+def comparable_command(command):
+    """The server command as the baseline comparison sees it.
+
+    Runner-owned values are masked, and the control-text switch is dropped: the
+    chosen arm is recorded in the report's ``control_text`` field, so both arms
+    must stay comparable or every cross-arm qualification is refused as an
+    unmatched baseline.
+    """
+    normalized = list(command[1:])
+    for flag in ("--port", "--cache-disk"):
+        if flag in normalized:
+            normalized[normalized.index(flag) + 1] = "<runner-owned>"
+    while CONTROL_TEXT_FLAG in normalized:
+        normalized.remove(CONTROL_TEXT_FLAG)
+    return normalized
+
+
 def sampling_overrides(command):
     return {field: convert(option(command, flag))
             for flag, (field, convert) in SAMPLING.items()
@@ -289,16 +319,16 @@ def main():
     vision = option(command, "--mmproj") is not None
     speculative = option(command, "--speculative",
                          "dspark" if option(command, "--dspark-model") else "off")
+    # The control-text suite asserts the behaviour its server was started with.
+    control_text = control_text_arm(command)
     base_url = f"http://127.0.0.1:{port}"
-    comparison_command = list(command[1:])
-    for flag in ("--port", "--cache-disk"):
-        if flag in comparison_command:
-            comparison_command[comparison_command.index(flag) + 1] = "<runner-owned>"
+    comparison_command = comparable_command(command)
     report = {**provenance(), "command": command, "comparison_command": comparison_command,
               "binary": str(Path(command[0]).resolve()),
               "mode": "baseline" if args.record_baseline else "qualification",
               "sampling_preset": args.sampling_preset, "sampling_overrides": overrides,
               "vision": vision, "speculative": speculative,
+              "control_text": control_text,
               "suites": {}, "through_case": args.through_case,
               "allow_missing_progress": args.allow_missing_progress,
               "started_ns": time.time_ns(), "status": "running"}
@@ -391,6 +421,8 @@ def main():
                     sdk_args += ["--expected-input-modalities", args.expected_input_modalities]
                 if option(command, "--think") is not None:
                     sdk_args += ["--server-thinking", option(command, "--think")]
+                if suite == "control-text":
+                    sdk_args += ["--control-text", control_text]
                 if suite == through_suite:
                     sdk_args += ["--through-case", through_case]
                 if args.allow_missing_progress:

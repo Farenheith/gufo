@@ -2553,11 +2553,16 @@ def main():
                         help="Server capacity; long-context fills roughly half, measured in usage")
     parser.add_argument("--speculative", choices=("off", "mtp", "dflash2", "dspark"),
                         default="off", help="Server mode; determines sampled replay guarantees")
+    parser.add_argument("--control-text", choices=("on", "off"),
+                        help="Server --experimental-control-text state; decides the "
+                             "expected control-text behaviour")
     args = parser.parse_args()
     if args.suite in ("discovery", "all") and args.expected_input_modalities is None:
         parser.error("discovery requires --expected-input-modalities text or text,image")
     if args.suite in ("image-inputs", "image-count") and not args.vision:
         parser.error("image-inputs and image-count require --vision and a loaded projector")
+    if args.suite == "control-text" and args.control_text is None:
+        parser.error("control-text requires --control-text on or off")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
         parser.error("--sampling-preset is required for all/sampling-defaults")
     if not isinstance(args.sampling_overrides, dict):
@@ -2618,7 +2623,7 @@ def main():
             "reasoning-separator": lambda: check_reasoning_separator(
                 client, args.model, checks, chat_result),
             "control-text": lambda: check_control_text(
-                client, args.model, checks, chat_result),
+                client, args.model, checks, chat_result, args.control_text),
             "tool-agent": lambda: check_tool_agent(
                 client, args.model, checks, chat_result, args.vision, image_content),
             "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),

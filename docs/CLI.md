@@ -78,6 +78,16 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
   help follow-up questions that build on the previous reasoning, at the cost
   of eating context.
 
+**Experimental behaviour (every flag defaults off)**
+
+- `experimentalControlText` — Flash-Next only: a stop token the model spells
+  out inside reasoning or an open code span or fence becomes its literal text
+  and the turn continues to its real end. In practice: a reply that discusses
+  or quotes its own end-of-turn token is no longer cut short where it writes
+  that token; text written for a refused stop the reply does not continue past
+  is dropped. Without the flag a stop token ends the turn, exactly as it did
+  before this behaviour existed.
+
 **Disk cache**
 
 - `cacheDisk` — enable an on-disk cache of computed prompt state, reused

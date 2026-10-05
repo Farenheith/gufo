@@ -57,6 +57,14 @@ struct TextDiskCacheConfig {
   std::string draft_model_artifact_fingerprint;
 };
 
+/// Behaviour that is still experimental. Every flag defaults off, and with
+/// them off the server behaves exactly as it did before the behaviour existed.
+struct TextExperimentalConfig {
+  /// A stop token a reply spells out inside reasoning or an open quote becomes
+  /// its literal text and the turn continues, instead of ending the turn.
+  bool control_text{false};
+};
+
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
 class InferenceBackend final : public TextGenerationBackend {
@@ -81,7 +89,8 @@ public:
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            TextExperimentalConfig experimental = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -113,7 +122,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            TextExperimentalConfig experimental = {});
 #endif
 
   /// Stable model identifier used in API responses.

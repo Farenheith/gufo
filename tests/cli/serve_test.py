@@ -66,6 +66,12 @@ def main():
     assert "8589934592" in help_text
     assert "0 = auto, at most 1 GiB and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
+    # Experimental behaviour defaults off, so the help must keep advertising
+    # both the flag and the group it belongs to.
+    assert "--experimental-control-text" in help_text
+    assert "Experimental:" in help_text
+    check(["serve", "llm", "--experimental-control-text", "--model", "audio"],
+          1, "Error loading model 'audio'")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all

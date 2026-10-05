@@ -82,7 +82,7 @@ draft limit for this suite. Audio and image/video generation have separate tests
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
 | `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
 | `reasoning-separator` | No leading separator newlines after reasoning in Chat/Responses, plain/tools/JSON; exact streamed/buffered text, warm retry, continuation and thinking-off paragraph breaks |
-| `control-text` | Flash-Next only: a stop token the model spells out inside reasoning or an open code span/fence becomes its literal text, and the turn continues to its real end; text written for an ending ask the model does not continue past is dropped, and nothing carries into the next request |
+| `control-text` | Flash-Next only, opt-in behind `--experimental-control-text`, and checked in both arms of it: with the flag a stop token the model spells out inside reasoning or an open code span/fence becomes its literal text, and the turn continues to its real end; text written for an ending ask the model does not continue past is dropped, and nothing carries into the next request. Without the flag the same fixtures require the token to end the turn where it appears |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
@@ -117,12 +117,15 @@ controls usable on older main with `--through-case image-count:image_count_contr
 
 `control-text` is Flash-Next only and stays out of `all`; select it explicitly
 for that profile in both of its modes (`off`, `mtp`), which speculate through
-different runners. Run correctness on the candidate and record the pre-fix
-behaviour of the same fixtures with the matching `main` binary as the control:
-before the change the turn ends the moment the token appears, so the sentinel
-and the visible answer are missing. Its fixtures make the model quote the
-end-of-turn token from its own knowledge, and a run that never spells the token
-fails as an unexercised fixture instead of passing.
+different runners. The behaviour is opt-in behind `--experimental-control-text`,
+and the suite asserts the arm its server was started with: with the flag the
+fixtures require the token to be written out and the turn to continue, without it
+they require the token to end the turn where it appears. Run both arms on the
+same binary: the run without the flag is the pre-feature control, so no separate
+`main` build is needed — there the turn ends the moment the token appears, so the
+sentinel and the visible answer are missing. Its fixtures make the model quote
+the end-of-turn token from its own knowledge, and a run that never spells the
+token fails as an unexercised fixture instead of passing.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`

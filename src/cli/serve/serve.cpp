@@ -605,6 +605,7 @@ void PrintServeHelp(std::string_view program_name,
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
+    bool experimental_control_text = false;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -715,6 +716,11 @@ void PrintServeHelp(std::string_view program_name,
                    "Log live prefill and decode progress (needs "
                    "--log-level=info or debug)",
                    "Logging", &log_progress);
+    parser.AddFlag("", "--experimental-control-text",
+                   "Experimental: a stop token spelled out inside reasoning "
+                   "or an open quote becomes its literal text and the turn "
+                   "continues (default: off)",
+                   "Experimental", &experimental_control_text);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -1138,6 +1144,7 @@ int RunServe(std::span<const char* const> args) {
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
+    bool experimental_control_text = false;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -1246,6 +1253,12 @@ int RunServe(std::span<const char* const> args) {
                        "--log-level=info or debug)",
                        "Logging", &log_progress);
 
+    llm_parser.AddFlag("", "--experimental-control-text",
+                       "Experimental: a stop token spelled out inside "
+                       "reasoning or an open quote becomes its literal text "
+                       "and the turn continues (default: off)",
+                       "Experimental", &experimental_control_text);
+
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
@@ -1347,6 +1360,10 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
+    using RamCacheOptions = server::TextRunnerRamCacheOptions;
+    const RamCacheOptions ram_cache{.capacity_bytes = cache_ram_bytes};
+    const server::TextExperimentalConfig experimental{
+        .control_text = experimental_control_text};
     if (!backend->load(model, &err, max_context, session_count,
                        server::TextPrefillPolicy{
                            .decode_active_tokens = prefill_chunk_tokens,
@@ -1373,9 +1390,7 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                       vision_model_path, ram_cache, experimental)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

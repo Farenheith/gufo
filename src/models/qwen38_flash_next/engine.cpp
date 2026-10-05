@@ -761,6 +761,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const auto anchor = chain.front();
   const auto k = static_cast<std::uint32_t>(chain.size());
   const auto vocab = model_->VocabSize();
+  // Records the token the chain stops at, so serving can decide whether the
+  // reply spelled it out instead of ending the turn. Only the token that
+  // decides the chain returns true, so the recorded token is that one.
   std::int32_t stop_token = -1;
   const auto is_stop = [&](std::int32_t token) {
     if (!request.stop_at_eos || !model_->IsStopToken(token))

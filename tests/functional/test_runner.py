@@ -1333,6 +1333,68 @@ sys.exit({exit_code})
             self.assertIsNotNone(process.returncode)
 
 
+class ControlTextSuiteTest(unittest.TestCase):
+    """The suite asserts the arm its server was started with."""
+
+    @staticmethod
+    def results(consumed):
+        def chat_result(client, request, streaming):
+            prompt = request["messages"][-1]["content"]
+            if "17 * 23" in prompt:
+                # The reasoning-end fixture never meets a token it spells out.
+                return {"finish": "stop", "reasoning": "r" * 20,
+                        "text": "ANSWER: 391"}
+            return {"finish": "stop", "reasoning": "thinking",
+                    "text": "cut here" if consumed else "<|im_end|> cut"}
+        return chat_result
+
+    def test_arm_follows_the_server_command(self):
+        serve = ["gufo", "serve", "llm", "--model", "m.gguf"]
+        self.assertEqual(functional.control_text_arm(serve), "off")
+        # The switch takes no value and may sit anywhere in the command.
+        self.assertEqual(
+            functional.control_text_arm([*serve, "--experimental-control-text"]), "on")
+        self.assertEqual(
+            functional.control_text_arm(["gufo", "serve", "llm",
+                                         "--experimental-control-text",
+                                         "--model", "m.gguf"]), "on")
+
+    def test_both_arms_stay_comparable(self):
+        # The arm must not reach the compared server contract, or qualifying the
+        # flag-off run against the flag-on run fails as an unmatched baseline.
+        serve = ["gufo", "serve", "--port", "41925", "llm", "--model", "m.gguf"]
+        off = functional.comparable_command(serve)
+        on = functional.comparable_command([*serve, "--experimental-control-text"])
+        self.assertEqual(off, on)
+        self.assertNotIn("--experimental-control-text", on)
+        self.assertIn("<runner-owned>", off)
+
+    def test_pre_feature_outcome_is_the_control_without_the_flag(self):
+        from control_text import check_control_text
+
+        # The token ending the turn satisfies the arm without the flag, and the
+        # same results must not satisfy the arm whose flag writes it out.
+        check_control_text(None, "m", {}, self.results(True), "off")
+        with self.assertRaises(AssertionError):
+            check_control_text(None, "m", {}, self.results(True), "on")
+
+    def test_a_written_token_fails_the_arm_without_the_flag(self):
+        from control_text import check_control_text
+
+        with self.assertRaises(AssertionError):
+            check_control_text(None, "m", {}, self.results(False), "off")
+
+    def test_consumed_rejects_an_answer_or_a_token_that_reached_the_client(self):
+        from control_text import assert_consumed
+
+        assert_consumed({"finish": "stop", "reasoning": "", "text": "cut"},
+                        "in reasoning")
+        for result in ({"finish": "stop", "reasoning": "<|endoftext|>", "text": ""},
+                       {"finish": "stop", "reasoning": "", "text": "DONE"}):
+            with self.assertRaises(AssertionError):
+                assert_consumed(result, "in reasoning")
+
+
 class PiWatchdogTest(unittest.TestCase):
     def test_repeated_command_can_make_progress(self):
         from pi_agent import repeated_actions

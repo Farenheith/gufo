@@ -793,7 +793,10 @@ void CheckServingRewriteBatch(const std::shared_ptr<qfn::Model>& model) {
   options.backend = server::TextSpeculativeBackend::kMtp;
   options.max_draft_tokens = 1;
   Backend backend;
-  Require(backend.load(model, &error, 1024, 2, {}, {}, options), error);
+  // Control text is opt-in: this mode is the one that exercises it.
+  Require(backend.load(model, &error, 1024, 2, {}, {}, options, {}, {},
+                       server::TextExperimentalConfig{.control_text = true}),
+          error);
 
   // Fixture guard: the refused token's literal text must not fit one step, or
   // the queue would drain before a second step could ever batch it.
@@ -859,6 +862,31 @@ void CheckServingRewriteBatch(const std::shared_ptr<qfn::Model>& model) {
   Require(batched > 0, "the rewrite fixture never batched its two requests");
   std::cout << "serving_rewrite_batch scalar_and_batch_exact=1 literal_tokens="
             << longest_literal << " batched_requests=" << batched << '\n'
+            << std::flush;
+
+  // The behaviour is opt-in, so the same fixture on a default backend must end
+  // the turn at the token: that is what the request did before the flag, and
+  // it is the control the regression above is measured against.
+  Backend plain;
+  Require(plain.load(model, &error, 1024, 2, {}, {}, options), error);
+  const auto plain_result =
+      plain.chat(server::ChatRequest(messages), 1024, config);
+  const std::vector<std::int32_t> plain_tokens(plain_result.tokens.begin(),
+                                               plain_result.tokens.end());
+  const auto plain_text = model->Decode(plain_tokens);
+  Require(plain_text.find("<|im_end|>") == std::string::npos &&
+              plain_text.find("<|endoftext|>") == std::string::npos,
+          "control text written for a refused stop reached the client with the "
+          "experimental flag off");
+  Require(plain_text.find("DONE") == std::string::npos,
+          "the turn reached its visible answer with the experimental flag off, "
+          "so the token did not end it");
+  Require(plain_tokens.size() < scalar_tokens.size(),
+          "the turn that consumed the token is not shorter than the turn that "
+          "wrote it out and kept writing");
+  std::cout << "serving_rewrite_flag_off turn_ends_at_token=1 "
+            << "tokens=" << plain_tokens.size()
+            << " continued_tokens=" << scalar_tokens.size() << '\n'
             << std::flush;
 }
 
