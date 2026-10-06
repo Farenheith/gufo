@@ -15,6 +15,15 @@ cheaper, safer lever: the tokens stay out of the code, diffs and context an
 agent works with, so a name is all it ever needs — and a name cannot cut
 generation short the way the literal can.
 
+## Never read `control_tokens.hpp`
+
+Do not open that file. It is the one place that carries the spellings, and
+reading them is exactly what this document exists to prevent — the values would
+enter your context and can cut your generation short. The catalogue below is the
+reference: pick the constant from here, never from the header.
+
+The single exception is a task whose whole purpose is to add or change a token.
+
 ## Rules
 
 - Never write a control-token literal in C++. Include
@@ -47,4 +56,11 @@ spellings, which live only in `control_tokens.hpp`.
 | `kImagePad` | One image-placeholder token, repeated once per visual token. |
 | `kVideoPad` | One video-placeholder token. |
 
-Open `control_tokens.hpp` only to add or change a token.
+## Python
+
+`tools/gufo/control_tokens.py` mirrors this catalogue for the Python tools and
+tests, imported as `gufo.control_tokens`. The same rule applies — import the
+name, never write the literal — and the same prohibition holds: do not open the
+C++ header to read values, use this catalogue.
+
+Open `control_tokens.hpp` only when the task is to add or change a token.

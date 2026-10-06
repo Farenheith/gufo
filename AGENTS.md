@@ -80,10 +80,11 @@ quality; successful optimizations become the default, without extra switches.
 ## Development
 
 - Keep model code, tests, tools and numerical contracts with their model.
-- Never spell a model control token as a string literal. Include
-  `src/models/qwen/control_tokens.hpp` and use the `gufo::tokenization` names;
-  the catalogue and per-token rules are in
-  [src/models/qwen/AGENTS.md](src/models/qwen/AGENTS.md).
+- Never spell a model control token as a string literal. In C++ include
+  `src/models/qwen/control_tokens.hpp` and use the `gufo::tokenization` names; in
+  Python import `tools/gufo/control_tokens.py` as `gufo.control_tokens`. The
+  catalogue, the rules, and the prohibition on reading the header to get values
+  are in [src/models/qwen/AGENTS.md](src/models/qwen/AGENTS.md).
 - Use one canonical long option and backend name per behavior; avoid aliases.
 - Use `gh` for GitHub operations after checking `gh auth status`.
 - Follow Conventional Commits with a single-line message. Title pull requests
