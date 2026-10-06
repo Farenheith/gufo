@@ -4,10 +4,16 @@ Every Qwen control token is spelled in exactly one file:
 [`control_tokens.hpp`](control_tokens.hpp). Code, tests, tools and docs
 reference the `gufo::tokenization` names instead of writing the token out.
 
-Why: one spelling means a producer and a consumer cannot disagree, a mistyped
-token cannot be invented at a call site, and the raw spellings stay out of an
-agent's context — an assistant that only ever reads the names cannot corrupt a
-framing marker by copying it.
+Why: these tokens are special to the inference engine as much as to the model.
+An agent that reads a raw spelling in the tree, or writes one into a patch, can
+have its own generation cut short — the engine sees the token rather than the
+text. Making inference robust wherever a token might surface in an agent's
+context (prompts, file contents, tool output, diffs) is an open-ended and likely
+impossible mission, and doing it on the inference path carries a real risk to
+the product's stability. Isolating the spellings in one small file is the
+cheaper, safer lever: the tokens stay out of the code, diffs and context an
+agent works with, so a name is all it ever needs — and a name cannot cut
+generation short the way the literal can.
 
 ## Rules
 
