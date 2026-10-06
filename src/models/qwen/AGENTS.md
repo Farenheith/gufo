@@ -7,13 +7,8 @@ reference the `gufo::tokenization` names instead of writing the token out.
 Why: these tokens are special to the inference engine as much as to the model.
 An agent that reads a raw spelling in the tree, or writes one into a patch, can
 have its own generation cut short — the engine sees the token rather than the
-text. Making inference robust wherever a token might surface in an agent's
-context (prompts, file contents, tool output, diffs) is an open-ended and likely
-impossible mission, and doing it on the inference path carries a real risk to
-the product's stability. Isolating the spellings in one small file is the
-cheaper, safer lever: the tokens stay out of the code, diffs and context an
-agent works with, so a name is all it ever needs — and a name cannot cut
-generation short the way the literal can.
+text. Keeping the spellings in one small file keeps them out of the code, diffs
+and context an agent works with.
 
 ## Never read `control_tokens.hpp`
 
@@ -21,8 +16,6 @@ Do not open that file. It is the one place that carries the spellings, and
 reading them is exactly what this document exists to prevent — the values would
 enter your context and can cut your generation short. The catalogue below is the
 reference: pick the constant from here, never from the header.
-
-The single exception is a task whose whole purpose is to add or change a token.
 
 ## Rules
 
@@ -62,5 +55,3 @@ spellings, which live only in `control_tokens.hpp`.
 tests, imported as `gufo.control_tokens`. The same rule applies — import the
 name, never write the literal — and the same prohibition holds: do not open the
 C++ header to read values, use this catalogue.
-
-Open `control_tokens.hpp` only when the task is to add or change a token.
