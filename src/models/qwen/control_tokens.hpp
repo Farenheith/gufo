@@ -11,10 +11,11 @@ namespace gufo::tokenization {
 /// the chat template, the tokenizers, the servers and the tests all read them
 /// here, so a typo in one call site can no longer invent a token.
 ///
-/// The `<|...|>` family is the shared Qwen vocabulary, reused by Qwen3.8,
-/// Qwen-Image, Qwen3-TTS, Qwen3-ASR and MiniMax H3. Non-`<|...|>` framing such
-/// as `<tool_call>`, `<think>` and the DeepSeek `<｜DSML｜...>` markers is not
-/// part of this table.
+/// The table is the shared Qwen vocabulary, reused by Qwen3.8, Qwen-Image,
+/// Qwen3-TTS, Qwen3-ASR and MiniMax H3. Other framing families — the tool-call
+/// and thinking markers, and DeepSeek's full-width delimiters — are not part of
+/// it. See `AGENTS.md` in this directory for the catalogue, which names each
+/// constant without repeating its spelling.
 inline constexpr std::string_view kEndOfText = "<|endoftext|>";
 inline constexpr std::string_view kImStart = "<|im_start|>";
 inline constexpr std::string_view kImEnd = "<|im_end|>";
