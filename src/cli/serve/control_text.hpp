@@ -8,42 +8,27 @@
 
 namespace gufo::server {
 
-/// True when the assistant text ends inside reasoning or an open quote. A stop
-/// token the model emits there is the token spelled as text, not the end of the
-/// turn: replies that discuss their own markup, or quote it, keep going.
+/// True when a stop token the model emitted at this point is the token spelled
+/// as text rather than the end of the turn: the model is writing it as code.
 ///
-/// The text handed in starts at the assistant framing marker, so the template's
-/// own `<think>` opening already counts as reasoning.
+/// Both triggers are local by design, so nothing written earlier can decide
+/// the question. The token counts as text when a backtick sits immediately
+/// before it — the model just opened an inline code span — or when the text
+/// ends inside an open fenced code block, markdown's other code form. An
+/// unmatched delimiter kilobytes back, an apostrophe, a curly quote and any
+/// other language punctuation leave the decision untouched, and a reply that
+/// is merely still reasoning no longer reads as quoting on its own, which is
+/// what left an ordinary end of a reply unable to end the turn.
+///
+/// The text handed in is the reply as written up to that point, starting at
+/// the assistant framing marker.
 [[nodiscard]] inline bool ControlTextIsLiteral(std::string_view text) {
-  QuoteTracker quotes;
-  quotes.Reset(text);
-  if (quotes.OpenAtEnd()) {
+  if (!text.empty() && text.back() == '`') {
     return true;
   }
-  // Track the block, not a toggle. A reply that spells the tags out — an
-  // example inside its own reasoning, a nested block — keeps its outer block
-  // open, because the example pairs with itself. A close outside reasoning is
-  // ignored rather than opening a block. One scan per tag keeps the walk
-  // linear: the reply can be long, this runs whenever the model asks to stop.
-  int depth = 0;
-  std::size_t cursor = 0;
-  while (cursor < text.size()) {
-    const auto tag = text.find('<', cursor);
-    if (tag == std::string_view::npos) {
-      break;
-    }
-    const auto rest = text.substr(tag);
-    if (rest.starts_with(kThinkStart)) {
-      ++depth;
-      cursor = tag + kThinkStart.size();
-    } else if (rest.starts_with(kThinkEnd)) {
-      depth = depth > 0 ? depth - 1 : 0;
-      cursor = tag + kThinkEnd.size();
-    } else {
-      cursor = tag + 1;
-    }
-  }
-  return depth > 0;
+  QuoteTracker fence;
+  fence.Reset(text);
+  return fence.FenceOpenAtEnd();
 }
 
 }  // namespace gufo::server

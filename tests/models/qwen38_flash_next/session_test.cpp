@@ -780,10 +780,10 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
 /// path must agree with it token for token.
 ///
 /// A one-token draft chain caps a step at two committed tokens, so the literal
-/// text of a stop token the model spells out inside its reasoning crosses the
-/// step boundary and stays queued. Without that budget the whole literal would
-/// commit in the step that refused the token and no second step could observe
-/// the ordering.
+/// text of a stop token the model writes as code inside its reasoning crosses
+/// the step boundary and stays queued. Without that budget the whole literal
+/// would commit in the step that refused the token and no second step could
+/// observe the ordering.
 void CheckServingRewriteBatch(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   namespace qt = gufo::tokenization;
@@ -818,8 +818,9 @@ void CheckServingRewriteBatch(const std::shared_ptr<qfn::Model>& model) {
           "control-token literal fits the fixture's two-token step budget, so "
           "the queued rewrite cannot cross a step boundary");
 
-  // The turn quotes the token that ends it inside backticks while it reasons,
-  // so the runner refuses that token and writes its literal text out instead.
+  // The turn writes the token that ends it as code inside backticks while it
+  // reasons: the code span is what makes the runner refuse that token and write
+  // its literal text out instead.
   const std::vector<qt::ChatMessage> messages{qt::ChatMessage{
       qt::ChatRole::kUser,
       "Start your private reasoning by quoting the exact text of the control "

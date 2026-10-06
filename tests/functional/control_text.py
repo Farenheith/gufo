@@ -1,22 +1,23 @@
-"""Stop tokens the model spells out inside reasoning or a quoted span.
+"""Stop tokens the model writes as code instead of ending its turn.
 
 Flash-Next only, and opt-in behind the server's ``--experimental-control-text``.
 The model ends its turn with a control token that the runner refuses while the
-reply is inside reasoning or inside an open code span or fence; those turns
-commit the token's literal text instead and keep writing. That text reaches the
-client only once the reply continues: a reply that asks to stop again immediately
-ends with its answer and without the text.
+reply is writing that token as code - a backtick immediately before it, or an
+open fenced code block around it; those turns commit the token's literal text
+instead and keep writing. That text reaches the client only once the reply
+continues: a reply that asks to stop again immediately ends with its answer and
+without the text.
 
 Both arms of the flag are checked against the same fixtures, so the same binary
 supplies the qualification and its control. With the flag the fixtures below
-force the model to name that token, so the boundary is exercised with the turn's
-real end still ahead of it: a turn cut by the token stops as soon as it appears
-and never reaches the DONE sentinel. Without the flag the token must end the
-turn where it appears, which is the pre-feature behaviour: nothing is written
-for it, and the visible answer is never reached.
+force the model to name that token as code, so the boundary is exercised with
+the turn's real end still ahead of it: a turn cut by the token stops as soon as
+it appears and never reaches the DONE sentinel. Without the flag the token must
+end the turn where it appears, which is the pre-feature behaviour: nothing is
+written for it, and the visible answer is never reached.
 
-Both stop tokens are covered, a fence the model leaves open counts as a quote,
-and nothing written for a refused stop survives into the next request.
+Both stop tokens are covered, a fence the model leaves open counts as code, and
+nothing written for a refused stop survives into the next request.
 """
 
 import sys

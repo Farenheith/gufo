@@ -89,6 +89,38 @@ void TestExplicitPhaseBoundary() {
          "spelled phase tags inside inline text do not reset quotes");
 }
 
+/// The control-text decision asks only whether the text ends inside an open
+/// fence, so the tracker answers that question alone and leaves the inline
+/// comparison to the parser.
+void TestOpenFenceDecision() {
+  QuoteTracker tracker;
+  tracker.Reset("```\n");
+  Expect(tracker.FenceOpenAtEnd(), "an opener's newline opens the fence");
+  tracker.Reset("```\ncode\n");
+  Expect(tracker.FenceOpenAtEnd(), "body text stays inside the fence");
+  tracker.Reset("```\ncode\n```\n");
+  Expect(!tracker.FenceOpenAtEnd(), "a closed fence is not open");
+  tracker.Reset("```\ncode\n```");
+  Expect(!tracker.FenceOpenAtEnd(),
+         "a trailing run that would close the fence is provisional");
+  tracker.Reset("```\ncode\n```text\n");
+  Expect(tracker.FenceOpenAtEnd(),
+         "a closer with text after it does not close the fence");
+  tracker.Reset("~~~\n");
+  Expect(tracker.FenceOpenAtEnd(), "a tilde fence opens the same way");
+  tracker.Reset("``\n");
+  Expect(!tracker.FenceOpenAtEnd(), "a two-backtick line is not a fence");
+  tracker.Reset("`\n");
+  Expect(!tracker.FenceOpenAtEnd(), "an inline run is not a fence");
+  tracker.Reset("plain\n");
+  Expect(!tracker.FenceOpenAtEnd(), "prose has no fence");
+  const std::string phase = "```\n</think>\n";
+  tracker.Reset(phase,
+                phase.find("</think>") + std::string_view("</think>").size());
+  Expect(!tracker.FenceOpenAtEnd(),
+         "starting the scope after the phase marker drops the earlier fence");
+}
+
 void TestOwnershipAndLinearity() {
   QuoteTracker tracker;
   std::string reused = "`<marker>`";
@@ -116,6 +148,7 @@ void TestOwnershipAndLinearity() {
 int main() {
   TestCompletedSpans();
   TestUnfinishedFenceDecision();
+  TestOpenFenceDecision();
   TestOwnershipAndLinearity();
   TestExplicitPhaseBoundary();
   std::cout << "quote_tracker_test: passed\n";

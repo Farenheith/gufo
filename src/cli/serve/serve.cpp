@@ -717,9 +717,9 @@ void PrintServeHelp(std::string_view program_name,
                    "--log-level=info or debug)",
                    "Logging", &log_progress);
     parser.AddFlag("", "--experimental-control-text",
-                   "Experimental: a stop token spelled out inside reasoning "
-                   "or an open quote becomes its literal text and the turn "
-                   "continues (default: off)",
+                   "Experimental: a stop token the model writes inside an "
+                   "inline code span or a fenced code block becomes its "
+                   "literal text and the turn continues (default: off)",
                    "Experimental", &experimental_control_text);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
@@ -1254,9 +1254,9 @@ int RunServe(std::span<const char* const> args) {
                        "Logging", &log_progress);
 
     llm_parser.AddFlag("", "--experimental-control-text",
-                       "Experimental: a stop token spelled out inside "
-                       "reasoning or an open quote becomes its literal text "
-                       "and the turn continues (default: off)",
+                       "Experimental: a stop token the model writes inside "
+                       "an inline code span or a fenced code block becomes "
+                       "its literal text and the turn continues (default: off)",
                        "Experimental", &experimental_control_text);
 
     add_server_options(llm_parser);

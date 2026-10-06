@@ -82,22 +82,12 @@ public:
            position < std::prev(next)->end;
   }
 
-  /// True when the text ends inside a span that is still open, so the writing
-  /// continues in quoting. A pending delimiter decides as it reads: a run that
-  /// closes the open span ends it, a run with no open span starts one.
-  [[nodiscard]] bool OpenAtEnd() const {
-    const auto end = text_.size();
-    if (fence_size_ > 0) {
-      return !PendingRunClosesFence();
-    }
-    if (inline_size_ > 0) {
-      return !(PendingRunClosesInline() && run_begin_ + run_size_ == end);
-    }
-    if (run_size_ == 0 || run_begin_ + run_size_ != end)
-      return false;
-    if (run_char_ == '`')
-      return true;
-    return run_size_ >= 3 && AtLineStart(run_begin_);
+  /// True when the text ends inside a fenced code block that is still open, so
+  /// the writing continues in code. A trailing run that would close the open
+  /// fence is provisional: its line has not ended, so the closer has not
+  /// decided yet, and a fence about to be closed is not one to write inside.
+  [[nodiscard]] bool FenceOpenAtEnd() const {
+    return fence_size_ > 0 && !PendingRunClosesFence();
   }
 
   [[nodiscard]] std::size_t bytes_scanned() const noexcept {
