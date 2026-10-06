@@ -72,6 +72,10 @@ void TestUnfinishedFenceDecision() {
   tracker.Reset("`<marker>`");
   Expect(tracker.QuotedAt(1) && !tracker.UnclosedAt(1),
          "a complete inline span never uses the fallback");
+  tracker.Reset("`example\n<marker>\n~~~\ncode\n");
+  Expect(!tracker.QuotedAt(9) && tracker.UnclosedAt(9),
+         "a fence ends an unfinished inline example, which still requires "
+         "schema validation");
   tracker.Reset("plain <marker>");
   Expect(!tracker.QuotedAt(6),
          "reset discards the preceding response's quote state");
@@ -114,6 +118,14 @@ void TestOpenFenceDecision() {
   Expect(!tracker.FenceOpenAtEnd(), "an inline run is not a fence");
   tracker.Reset("plain\n");
   Expect(!tracker.FenceOpenAtEnd(), "prose has no fence");
+  tracker.Reset("prose `unmatched\n~~~\n");
+  Expect(tracker.FenceOpenAtEnd(),
+         "an unmatched inline span does not hide a later fence");
+  tracker.Reset("`span\n```\n");
+  Expect(tracker.FenceOpenAtEnd(), "a fence interrupts an unfinished span");
+  tracker.Reset("`span\n```\nbody\n```\n");
+  Expect(!tracker.FenceOpenAtEnd(),
+         "the fence that interrupted it still closes");
   const std::string phase = "```\n</think>\n";
   tracker.Reset(phase,
                 phase.find("</think>") + std::string_view("</think>").size());

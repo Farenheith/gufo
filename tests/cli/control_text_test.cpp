@@ -97,6 +97,18 @@ std::size_t TestFencedCodeBlock() {
       {"```\ncode\n~~~\n", true, "a tilde run does not close a backtick fence"},
       {"```\ncode\n```\n```\n", true,
        "a fence opened after a closed one is open"},
+      // A fence is a block boundary, so a delimiter left unmatched on an
+      // earlier line cannot stop the fence from opening under the decision.
+      {"prose `unmatched\n~~~\ncode\n", true,
+       "an unmatched inline backtick does not hide a later tilde fence"},
+      {"prose `unmatched\n```\ncode\n", true,
+       "an unmatched inline backtick does not hide a later backtick fence"},
+      {"prose `matched`\n~~~\ncode\n", true,
+       "a span closed before the fence leaves the fence open"},
+      {"prose `unmatched\n\n~~~\ncode\n", true,
+       "a blank line ends the inline span before the fence"},
+      {"prose `unmatched\n~~~\ncode\n~~~\n", false,
+       "a fence opened past an unmatched delimiter still closes"},
       {"``\n", false, "a two-backtick line is not a fence"},
       {"```", true, "a fence opener at the very end reads as an opening run"},
       {"x ```\n", false, "a run that does not start its line is not a fence"},

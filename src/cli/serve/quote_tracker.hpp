@@ -115,6 +115,15 @@ private:
     return run_char_ == '`' && run_size_ == inline_size_;
   }
 
+  /// A block boundary ends an unfinished inline span. Retain its range so
+  /// possible calls still require the schema-checked fallback.
+  void EndUnfinishedInline(std::size_t at) {
+    if (inline_size_ == 0)
+      return;
+    unfinished_inline_.push_back({inline_begin_, at});
+    inline_size_ = 0;
+  }
+
   void FlushRun() {
     if (run_size_ == 0)
       return;
@@ -124,7 +133,11 @@ private:
         closing_fence_ = true;
         close_begin_ = run_begin_;
       }
-    } else if (inline_size_ == 0 && run_size_ >= 3 && AtLineStart(run_begin_)) {
+    } else if (run_size_ >= 3 && AtLineStart(run_begin_)) {
+      // A run of three or more at its line's start opens a fence whatever a
+      // delimiter on an earlier line left open: a fence is a block boundary,
+      // so an unfinished inline span cannot reach across it.
+      EndUnfinishedInline(run_begin_);
       fence_char_ = run_char_;
       fence_size_ = run_size_;
       fence_begin_ = run_begin_ + run_size_;
@@ -163,12 +176,8 @@ private:
         fence_size_ = 0;
         fence_char_ = 0;
       }
-      if (inline_size_ > 0 && first_nonblank_ == std::string_view::npos) {
-        // A blank line ends an unfinished inline span. Retain its range so
-        // possible calls still require the schema-checked fallback.
-        unfinished_inline_.push_back({inline_begin_, cursor});
-        inline_size_ = 0;
-      }
+      if (first_nonblank_ == std::string_view::npos)
+        EndUnfinishedInline(cursor);
       closing_fence_ = false;
       first_nonblank_ = std::string_view::npos;
     } else if (byte != ' ' && byte != '\t' && byte != '\r') {
