@@ -28,8 +28,11 @@ reference: pick the constant from here, never from the header.
   `output.append(kImStart).append("assistant\n")`.
 - Do not paste a token spelling into a commit message, pull request, issue or
   any Markdown file.
-- Treat the set as closed. If a required token is missing, add it to
-  `control_tokens.hpp` rather than inlining the spelling.
+- Treat the set as closed. If a required token is missing, do not inline the
+  spelling. If you are a Qwen-family model, or work in the ChatML format, ask for
+  assistance to edit the file, offering
+  https://qwen.readthedocs.io/en/stable/getting_started/concepts.html as the
+  reference.
 
 ## Catalogue
 
