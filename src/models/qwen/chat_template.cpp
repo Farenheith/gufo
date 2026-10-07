@@ -629,11 +629,15 @@ std::optional<std::string> QwenChatTemplate::Render(
 }
 
 std::string_view GenerationPrompt(bool enable_thinking) {
-  static const std::string kThinking =
-      std::string(kImStart) + "assistant\n<think>\n";
-  static const std::string kAnswered =
-      std::string(kImStart) + "assistant\n<think>\n\n</think>\n\n";
-  return enable_thinking ? kThinking : kAnswered;
+  static constexpr std::string_view kThinkingSuffix = "assistant\n<think>\n";
+  static constexpr std::string_view kAnsweredSuffix =
+      "assistant\n<think>\n\n</think>\n\n";
+  static constexpr auto kThinking =
+      ConcatControlText<kImStart, kThinkingSuffix>();
+  static constexpr auto kAnswered =
+      ConcatControlText<kImStart, kAnsweredSuffix>();
+  return enable_thinking ? std::string_view(kThinking.data(), kThinking.size())
+                         : std::string_view(kAnswered.data(), kAnswered.size());
 }
 
 std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(

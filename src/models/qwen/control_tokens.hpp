@@ -1,21 +1,14 @@
 #ifndef GUFO_TOKENIZATION_QWEN_CONTROL_TOKENS_HPP_
 #define GUFO_TOKENIZATION_QWEN_CONTROL_TOKENS_HPP_
 
+#include <algorithm>
+#include <array>
 #include <string_view>
 
 namespace gufo::tokenization {
 
-/// Qwen's `<|...|>` control tokens, declared once so every producer and
-/// consumer of the framing vocabulary references a name instead of spelling
-/// the literal. Keep this the only header that carries the token spellings:
-/// the chat template, the tokenizers, the servers and the tests all read them
-/// here, so a typo in one call site can no longer invent a token.
-///
-/// The table is the shared Qwen vocabulary, reused by Qwen3.8, Qwen-Image,
-/// Qwen3-TTS, Qwen3-ASR and MiniMax H3. Other framing families — the tool-call
-/// and thinking markers, and DeepSeek's full-width delimiters — are not part of
-/// it. See `AGENTS.md` in this directory for the catalogue, which names each
-/// constant without repeating its spelling.
+/// Shared Qwen framing, also used by Qwen-Image, audio models and MiniMax H3.
+/// Other token families remain with their models. See AGENTS.md for guidance.
 inline constexpr std::string_view kEndOfText = "<|endoftext|>";
 inline constexpr std::string_view kImStart = "<|im_start|>";
 inline constexpr std::string_view kImEnd = "<|im_end|>";
@@ -30,6 +23,15 @@ inline constexpr std::string_view kVisionEnd = "<|vision_end|>";
 inline constexpr std::string_view kVisionPad = "<|vision_pad|>";
 inline constexpr std::string_view kImagePad = "<|image_pad|>";
 inline constexpr std::string_view kVideoPad = "<|video_pad|>";
+
+/// Compose fixed framing without allocation or dynamic initialization.
+template<const std::string_view&... Parts>
+consteval auto ConcatControlText() {
+  std::array<char, (Parts.size() + ...)> text{};
+  auto output = text.begin();
+  ((output = std::copy(Parts.begin(), Parts.end(), output)), ...);
+  return text;
+}
 
 }  // namespace gufo::tokenization
 

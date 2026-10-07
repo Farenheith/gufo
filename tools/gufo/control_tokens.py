@@ -1,18 +1,8 @@
 """Qwen control tokens, mirrored from ``src/models/qwen/control_tokens.hpp``.
 
-A control token is spelled in exactly one place per language: the C++ header
-``src/models/qwen/control_tokens.hpp`` and this module. Every Python producer or
-consumer imports the name instead of writing the literal, so a token has one
-spelling and a typo cannot invent a new one.
-
-The rule in ``AGENTS.md`` — never inline a control-token literal — applies to
-Python exactly as it does to C++, and for the same reason: these tokens are
-special to the inference engine, so a raw spelling in an agent's context can cut
-generation short. Keep this file the only Python source that carries the
-spellings.
-
-The names deliberately match the C++ catalogue so one name means one token
-across the repository.
+Keep shared names and values identical to the C++ catalogue. Validate changes
+against pinned model metadata and independent reference fixtures; centralizing
+these strings does not change tokenization or EOS handling.
 """
 
 from __future__ import annotations

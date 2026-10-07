@@ -130,13 +130,14 @@ Visual EncodeVision(Runtime& rt, const Image& image,
   return output;
 }
 
-const std::string& SystemPrompt() {
-  static const std::string kSystem =
-      std::string(tokenization::kImStart) +
-      "system\nComprehend and analyze the provided prompt." +
-      std::string(tokenization::kImEnd) + "\n";
-  return kSystem;
-}
+constexpr std::string_view kSystemText =
+    "system\nComprehend and analyze the provided prompt.";
+constexpr std::string_view kNewline = "\n";
+constexpr auto kSystemStorage =
+    tokenization::ConcatControlText<tokenization::kImStart, kSystemText,
+                                    tokenization::kImEnd, kNewline>();
+constexpr std::string_view kSystem(kSystemStorage.data(),
+                                   kSystemStorage.size());
 
 struct EncodedPrompt {
   Matrix hidden;
@@ -150,7 +151,7 @@ EncodedPrompt EncodePrompt(Runtime& rt, const Tokenizer& tokenizer,
                            const CancellationCheck& cancelled,
                            const Observer& observer) {
   EncodedPrompt output;
-  std::string text = SystemPrompt();
+  std::string text(kSystem);
   text.append(tokenization::kImStart).append("user\n");
   for (std::size_t i = 0; i < request.images.size(); ++i) {
     if (i)
@@ -203,7 +204,7 @@ EncodedPrompt EncodePrompt(Runtime& rt, const Tokenizer& tokenizer,
     throw std::logic_error("image prompt layout mismatch");
   if (output.ids.size() > 16384)
     throw std::invalid_argument("image prompt exceeds 16384 encoder tokens");
-  output.drop = tokenizer.Encode(SystemPrompt()).size();
+  output.drop = tokenizer.Encode(kSystem).size();
   const std::string prefix = "text_encoder.model.language_model.";
   auto x = rt.Embed(rt.Weight(prefix + "embed_tokens.weight"), output.ids);
   std::array<Matrix, 3> deep;
