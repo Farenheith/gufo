@@ -46,11 +46,16 @@ in resident slabs sized from the budget, and read the rest through the OS
 page cache from the mapped GGUF, like ds4's SSD expert streaming. A
 per-layer LRU resolves each forward's routed ids on the host into slot
 numbers, and the existing expert kernels run on the slabs with the same
-weight bytes and reduction order: decode is bit-exact against the
-fully-resident build for the same expert selections. Streamed layers run
-the vector expert route at every pass width, so their prefill can round
-differently from the resident build's tiled route (streamed layers'
-prefill only; decode arithmetic is the same route). Size-class outliers (the UD Q8_0-down layers, the Q8_0
+weight bytes. The contract is **quality parity, not bit parity**: decode
+runs the same kernels the resident build uses at decode width, so from an
+identical KV state its rows are identical, but streamed prefill runs the
+vector route where the resident build uses its tiled route, and the two
+kernels sum in different orders. Greedy output therefore diverges from
+the fully-resident build wherever the ULP-level logits flip an argmax,
+and the divergence compounds like any other chaotic tie-break. Quality
+is expected to match within evaluation noise, not token hashes; that
+equivalence has not been benchmarked yet. Size-class outliers (the UD
+Q8_0-down layers, the Q8_0
 MTP block) stay fully resident. While streaming, decode graph replay is
 off (routing resolves on the host); budgets covering all 512 experts are
 rejected because full residency is then cheaper. Expect lower decode

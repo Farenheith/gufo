@@ -2503,9 +2503,13 @@ bool Executor::MoeStream(const DeviceLayer& l, const float* x, float* out,
   // router's ids are downloaded once, resolved to resident cache slots
   // (LRU, misses loaded from the mapped GGUF onto this same stream) and
   // uploaded back, so the expert kernels read identical weight bytes
-  // through the existing vector routes: decode output is bit-exact vs the
-  // fully-resident build. Groups of at most kStreamGroupTokens rows keep
-  // every launch on the vector expert paths (ids resolve per group).
+  // through the existing vector routes. Parity contract: identical rows
+  // from an identical KV state (same kernels at decode width), quality
+  // parity overall — not bit parity end-to-end, because the resident
+  // build's tiled prefill route sums in a different order and greedy
+  // compounding ULP flips diverge the text. Groups of at most
+  // kStreamGroupTokens rows keep every launch on the vector expert paths
+  // (ids resolve per group).
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   if (n_tokens == 0) {

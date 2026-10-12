@@ -22,11 +22,14 @@ namespace gufo::models::qwen38_flash_next::rocm {
 /// A forward resolves the router's expert ids on the host against a
 /// per-layer LRU, loads misses into slots through a pinned staging ring,
 /// and rewrites the id buffer with slot numbers. The projections then run
-/// the existing expert kernels on the slabs: the weight bytes and the
-/// arithmetic are identical to the fully-resident vector route, so decode
-/// output is bit-exact; only placement changes. Streamed layers take the
-/// vector route at every pass width, so their prefill can round
-/// differently from the fully-resident build's tiled route. Because
+/// the existing expert kernels on the slabs: the weight bytes are
+/// identical, and at decode widths the resident build runs the same
+/// vector route, so rows from an identical KV state are identical.
+/// End-to-end the contract is quality parity, NOT bit parity: streamed
+/// layers take the vector route at every pass width while the resident
+/// build switches to its tiled route above 8 rows, and the different
+/// summation order flips greedy argmaxes on ULP ties, compounding from
+/// prefill onward. Because
 /// placement is host-side orchestration inside a forward, decode-graph
 /// capture and replay stay off while streaming (see the Executor's
 /// `graph` predicates).
