@@ -43,6 +43,7 @@ enum class GgmlType : std::uint16_t {
   kIQ3_S = 21,
   kIQ2_S = 22,
   kIQ4_XS = 23,
+  kQ2_0 = 42,
   kI32 = 26,
   kIQ1_M = 29,
   kBF16 = 30,
@@ -94,6 +95,8 @@ enum class GgmlType : std::uint16_t {
       return "IQ2_S";
     case GgmlType::kIQ4_XS:
       return "IQ4_XS";
+    case GgmlType::kQ2_0:
+      return "Q2_0";
     case GgmlType::kI32:
       return "I32";
     case GgmlType::kIQ1_M:

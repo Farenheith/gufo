@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sampling.hpp>
 
 #include "src/families/qwen/hip_common/rope.hpp"
@@ -44,13 +45,51 @@ enum class WeightType : std::uint32_t {
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
+  kIQ3_XXS = 18,
+  kIQ4_NL = 20,
+  kIQ3_S = 21,
+  kIQ2_S = 22,
+  kIQ4_XS = 23,
   kBF16 = 30,
+  kQ2_0 = 42,
 };
+
+/// The storage the routed F16 WMMA family runs natively — the single
+/// authoritative list. At bind time it keeps gate/up tensors in their
+/// disk encoding (`DeviceModel::Copy`'s `native_routed` argument), and
+/// the Executor only launches WMMA for layers whose three matrices all
+/// appear here. A new storage (IQ2 kernels, later) flips here once a
+/// WMMA launcher exists — the host launch switches in kernels.hip.cpp
+/// must grow the matching case.
+constexpr bool RoutedNativeWMMA(core::GgmlType t) noexcept {
+  return t == core::GgmlType::kQ4_K || t == core::GgmlType::kQ5_K ||
+         t == core::GgmlType::kQ5_1 || t == core::GgmlType::kQ8_0 ||
+         t == core::GgmlType::kIQ4_NL || t == core::GgmlType::kIQ3_XXS ||
+         t == core::GgmlType::kIQ3_S || t == core::GgmlType::kIQ2_S ||
+         t == core::GgmlType::kIQ4_XS || t == core::GgmlType::kQ2_0;
+}
+
+/// Storages the vendored MMQ vec/tiled family dequantizes natively. A
+/// routed matrix outside this set must take the WMMA route at every
+/// batch size, because no MMQ kernel can read it; the Executor forces
+/// the WMMA route in that case instead of relying on matrix-sized tiles.
+constexpr bool RoutedMmqCapable(core::GgmlType t) noexcept {
+  return t == core::GgmlType::kQ4_K || t == core::GgmlType::kQ5_K ||
+         t == core::GgmlType::kQ5_1 || t == core::GgmlType::kQ8_0;
+}
 
 /// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream);
+
+/// Writes the degenerate single-expert tile map a native-quantized dense
+/// projection feeds RoutedF16Gemm: `tiles` gets ceil(n / tile_rows) tile
+/// entries, `bounds` the single bucket's [begin, end), and `rows` the
+/// identity token rows. All three buffers are device-side.
+void DenseGemmMap(std::int32_t* tiles, std::int32_t* bounds, std::int32_t* rows,
+                  std::uint32_t n, std::uint32_t tile_rows, hipStream_t stream);
 
 /// out[t][d] = rmsnorm(x[t][d]) * gamma[d]; `groups` independent norms of
 /// `dim/groups` elements each share the gamma row. gamma may be null.
@@ -221,6 +260,21 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
 void ExpandQ8_0(const void* q8, float* out, std::size_t count,
                 hipStream_t stream);
 
+/// Converts a tensor stored in one of the low-bit codebook formats (IQ2_S,
+/// IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS or Q2_0) to Q8_0 so it runs the existing
+/// Q8_0 expert/dense tiers. `elements` is the logical element count
+/// (cols * rows * experts); `source_type` carries the storage format. The
+/// reference element semantics match src/core/quant/ggml_dequant.cpp.
+
+/// out[i] = float(source[i]) for BF16 storage; used to upconvert BF16 stack
+/// members (RCO routers) so the existing F32 stack path can consume them.
+void UpcastBf16(const void* source, float* destination, std::size_t count,
+                hipStream_t stream);
+
+/// Same for F16 storage (RCO stores blk.1.ple_conv1d in F16).
+void UpcastF16(const void* source, float* destination, std::size_t count,
+               hipStream_t stream);
+
 /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
 /// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
 /// bytes, padded to the GEMM's 128-token macro tile), then an int8 WMMA
@@ -310,6 +364,14 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::int32_t* rows_token, std::int32_t* rows_slot,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
+
+/// Builds the routed tile launch map (`expert | tile << 16`, padded to
+/// `capacity` with -1 sentinels the WMMA GEMM exits on) from the per-expert
+/// `counts` on the device, for batches whose routing the host cannot read
+/// back because the pass replays a captured graph.
+void RoutedTiles(const std::uint32_t* counts, std::int32_t* tiles,
+                 std::uint32_t n_experts, std::uint32_t tile_rows,
+                 std::uint32_t capacity, hipStream_t stream);
 
 /// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
 /// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read

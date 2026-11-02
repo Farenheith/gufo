@@ -29,6 +29,11 @@ struct Conversion {
   /// Expands Q8_0 weights to F32 instead of narrowing F32 to F16.
   bool expand_q8{false};
   std::size_t source_bytes{0};
+  /// Source format when the tensor is a low-bit codebook weight converted
+  /// to Q8_0 during upload; kF32 means "no codebook conversion" (the type
+  /// is already carried by expand_q8 and the narrow path).
+  /// The staged source is F16 and widens to F32 after the drain.
+  bool f16_upcast{false};
 };
 
 /// The trunk and the optional MTP block as one traversal's output.
@@ -73,9 +78,25 @@ struct Uploader {
     return weights->Allocate(pointer, size);
   }
 
-  DeviceTensor Copy(const TensorRef& t) {
+  DeviceTensor Copy(const TensorRef& t, bool native_routed = false) {
     DeviceTensor d;
     if (t.empty() || !ok) {
+      return d;
+    }
+    // Gate/up/down call sites pass `native_routed` for the storages listed
+    // by kernels.hpp's RoutedNativeWMMA; every format that reaches this
+    // runtime now has a kernel that reads it as stored, at both the routed
+    // and the dense tier. Local inference runs under a memory ceiling, so
+    // a storage the kernels cannot read is a hard error rather than a
+    // silent inflation to a wider one. GGML pads a row to whole blocks up
+    // to a 64-element boundary, exactly the alignment the loaders assume.
+    const bool mmq_reads_it =
+        t.experts > 1 && native_routed && RoutedMmqCapable(t.type);
+    if (!mmq_reads_it &&
+        (RoutedNativeWMMA(t.type) || t.type == core::GgmlType::kQ6_K) &&
+        t.cols % 64 != 0) {
+      Fail("ragged-block row is not GGML-padded storage: " +
+           std::string(t.name));
       return d;
     }
     const std::size_t size = t.SizeBytes();
@@ -102,10 +123,13 @@ struct Uploader {
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
-    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
+    // Half-precision storages at any width, and every dense quantized row,
+    // stage through s_.x_half in the WMMA family.
+    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16 ||
+        t.experts == 1) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
-    if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
+    if (d.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
     return d;
@@ -117,6 +141,9 @@ struct Uploader {
   /// its dequantized values instead of quantizing their activations.
   DeviceTensor CopyF32(const TensorRef& t) {
     if (t.empty() || !ok || t.type != core::GgmlType::kQ8_0) {
+      if (t.type == core::GgmlType::kF16) {
+        return UpcastF32(t);
+      }
       return Copy(t);
     }
     DeviceTensor d = Copy(t);
@@ -135,6 +162,35 @@ struct Uploader {
     conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
                          kTailMargin, nullptr);
+    d.data = f32;
+    d.type = core::GgmlType::kF32;
+    return d;
+  }
+
+  /// Uploads an F16 tensor and widens it to F32 once the disk pipeline
+  /// drains (RCO stores the PLE conv in F16 while the conv kernels read
+  /// F32). The staged F16 source is freed after the conversion.
+  DeviceTensor UpcastF32(const TensorRef& t) {
+    DeviceTensor src = Copy(t);
+    if (t.empty() || !ok) {
+      return src;
+    }
+    const std::size_t count = t.cols * t.rows * t.experts;
+    void* f32 = nullptr;
+    if (Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name) +
+           " (F16 upconvert)");
+      return {};
+    }
+    if (Measuring()) {
+      return DeviceTensor{};
+    }
+    allocations.push_back(f32);
+    bytes += count * sizeof(float) + kTailMargin;
+    conversions.push_back({src.data, f32, count, false, t.SizeBytes(), true});
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
+                         kTailMargin, nullptr);
+    DeviceTensor d = src;
     d.data = f32;
     d.type = core::GgmlType::kF32;
     return d;
@@ -198,15 +254,29 @@ struct Uploader {
     }
     std::size_t rows = 0;
     std::size_t size = 0;
+    std::size_t bf16_members = 0;
     const core::GgmlType type = (*parts.begin())->type;
+    const bool f32_mode =
+        type == core::GgmlType::kF32 || type == core::GgmlType::kBF16;
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+      // F32 and BF16 members share one stack: the buffer is F32-shaped and
+      // BF16 members are upconverted in place once the disk pipeline drains
+      // (RCO checkpoints store some router rows in BF16).
+      const bool ok_type = type == core::GgmlType::kQ8_0
+                               ? t->type == core::GgmlType::kQ8_0
+                               : t->type == core::GgmlType::kF32 ||
+                                     t->type == core::GgmlType::kBF16;
+      if (t->empty() || !ok_type || t->cols != (*parts.begin())->cols ||
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0 &&
+           type != core::GgmlType::kBF16)) {
+        Fail("stacked upload needs F32/BF16 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
-      size += t->SizeBytes();
+      size += f32_mode ? t->rows * t->cols * sizeof(float) : t->SizeBytes();
+      if (t->type == core::GgmlType::kBF16) {
+        ++bf16_members;
+      }
     }
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -223,7 +293,19 @@ struct Uploader {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
-        offset += t->SizeBytes();
+        offset += f32_mode ? t->rows * t->cols * sizeof(float) : t->SizeBytes();
+      }
+    }
+    if (f32_mode && bf16_members != 0 && !Measuring()) {
+      // Upconvert the BF16 members in place: each element reads two bytes
+      // below where it writes, so one kernel over the region is race-free.
+      std::size_t offset = 0;
+      for (const TensorRef* t : parts) {
+        if (t->type == core::GgmlType::kBF16) {
+          conversions.push_back({static_cast<std::uint8_t*>(ptr) + offset,
+                                 nullptr, t->rows * t->cols, false, 0, false});
+        }
+        offset += t->rows * t->cols * sizeof(float);
       }
     }
     if (type == core::GgmlType::kQ8_0 && !expand_q8) {
@@ -332,11 +414,13 @@ struct Uploader {
     d.ple_norm_key = Copy(l.ple_norm_key);
     d.ple_norm_query = Copy(l.ple_norm_query);
     d.ple_norm_conv = Copy(l.ple_norm_conv);
-    d.ple_conv1d = Copy(l.ple_conv1d);
+    d.ple_conv1d = l.ple_conv1d.type == core::GgmlType::kF16
+                       ? UpcastF32(l.ple_conv1d)
+                       : Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
+    d.ffn_gate_exps = Copy(l.ffn_gate_exps, true);
+    d.ffn_up_exps = Copy(l.ffn_up_exps, true);
+    d.ffn_down_exps = Copy(l.ffn_down_exps, true);
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -406,14 +490,21 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
+  // Every bound storage must be executable by a kernel as stored: the
+  // accepted set is exactly what the dense/embedding WMMA loaders and the
+  // routed MMQ/WMMA families read. Anything else is rejected here — never
+  // inflated into a wider type to make it load, since local inference is
+  // bounded by device memory. (The Q6_K blanket rejection this replaces
+  // predated the native Q6_K loaders.)
   const auto supported = [&](const TensorRef& t) {
-    if (t.type != core::GgmlType::kQ6_K)
-      return true;
-    if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
-    return false;
+    const bool ok =
+        t.type == core::GgmlType::kF32 || t.type == core::GgmlType::kBF16 ||
+        t.type == core::GgmlType::kF16 || t.type == core::GgmlType::kQ8_0 ||
+        t.type == core::GgmlType::kQ4_K || t.type == core::GgmlType::kQ5_K ||
+        t.type == core::GgmlType::kQ6_K || RoutedNativeWMMA(t.type);
+    if (!ok && error_msg != nullptr)
+      *error_msg = "unsupported HIP tensor format: " + std::string(t.name);
+    return ok;
   };
   const auto layer_supported = [&](const LayerWeights& l) {
     return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
@@ -422,6 +513,22 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   if (!supported(w.token_embd) || !supported(w.output) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
+    return nullptr;
+  }
+  // token_embd and output are read row-wise by EmbedKernel through the
+  // RowElement scalar mirrors; a format outside that set would silently
+  // compute zero-stride rows, so reject it at load instead.
+  const auto embed_supported = [&](const TensorRef& t) {
+    const bool ok =
+        t.type == core::GgmlType::kF32 || t.type == core::GgmlType::kBF16 ||
+        t.type == core::GgmlType::kF16 || t.type == core::GgmlType::kQ8_0 ||
+        t.type == core::GgmlType::kQ6_K || t.type == core::GgmlType::kIQ4_XS;
+    if (!ok && error_msg != nullptr)
+      *error_msg = "embedding/logits gather has no scalar mirror for " +
+                   std::string(t.name);
+    return ok;
+  };
+  if (!embed_supported(w.token_embd) || !embed_supported(w.output)) {
     return nullptr;
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
@@ -475,27 +582,72 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
   m->has_mtp_ = mtp != nullptr;
-  for (const auto& c : conversions) {
-    if (c.expand_q8) {
-      ExpandQ8_0(c.source, static_cast<float*>(c.destination), c.count,
-                 nullptr);
-    } else {
-      NarrowActivations(static_cast<const float*>(c.source), c.destination,
-                        false, c.count, nullptr);
+  // Drain the staged conversions on the default stream. Entries with a
+  // null destination upconvert BF16 in place; they only feed the following
+  // narrow entry, so the launch loop is split around them.
+  for (std::size_t begin = 0; begin < conversions.size();) {
+    std::size_t end = begin;
+    while (end < conversions.size() &&
+           conversions[end].destination == nullptr) {
+      ++end;  // in-place entries are consumed by the split below
     }
-  }
-  const auto status = hipDeviceSynchronize();
-  if (status != hipSuccess) {
-    if (error_msg != nullptr) {
-      *error_msg =
-          "weight conversion failed: " + std::string(hipGetErrorString(status));
+    if (end == begin) {
+      ++end;
     }
-    return nullptr;
-  }
-  for (const auto& c : conversions) {
-    std::erase(m->allocations_, c.source);
-    (void)hipFree(c.source);
-    m->bytes_ -= c.source_bytes + kTailMargin;
+    for (std::size_t i = begin; i < end; ++i) {
+      const auto& c = conversions[i];
+      if (c.destination == nullptr) {
+        // In-place BF16->F32 is unsafe on-device: writing element i at byte
+        // 4i destroys the 2-byte source of elements 2i and 2i+1, and no
+        // thread ordering exists on the GPU to consume them first. Bounce
+        // the source (router matrices are a few MiB) so read and write
+        // regions are disjoint.
+        void* scratch = nullptr;
+        hipError_t scratchStatus = hipMalloc(&scratch, c.count * 2);
+        if (scratchStatus == hipSuccess) {
+          scratchStatus = hipMemcpy(scratch, c.source, c.count * 2,
+                                    hipMemcpyDeviceToDevice);
+        }
+        if (scratchStatus == hipSuccess) {
+          UpcastBf16(scratch, static_cast<float*>(c.source), c.count, nullptr);
+        }
+        (void)hipFree(scratch);
+        if (scratchStatus != hipSuccess) {
+          if (error_msg != nullptr) {
+            *error_msg = "router BF16 upconvert failed: " +
+                         std::string(hipGetErrorString(scratchStatus));
+          }
+          return nullptr;
+        }
+      } else if (c.f16_upcast) {
+        UpcastF16(c.source, static_cast<float*>(c.destination), c.count,
+                  nullptr);
+      } else if (c.expand_q8) {
+        ExpandQ8_0(c.source, static_cast<float*>(c.destination), c.count,
+                   nullptr);
+      } else {
+        NarrowActivations(static_cast<const float*>(c.source), c.destination,
+                          false, c.count, nullptr);
+      }
+    }
+    const auto status = hipDeviceSynchronize();
+    if (status != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = "weight conversion failed: " +
+                     std::string(hipGetErrorString(status));
+      }
+      return nullptr;
+    }
+    for (std::size_t i = begin; i < end; ++i) {
+      const auto& c = conversions[i];
+      if (c.destination == nullptr) {
+        continue;  // in place; the owner frees the buffer below
+      }
+      std::erase(m->allocations_, c.source);
+      (void)hipFree(c.source);
+      m->bytes_ -= c.source_bytes + kTailMargin;
+    }
+    begin = end;
   }
   return m;
 }

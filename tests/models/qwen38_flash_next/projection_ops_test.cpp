@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -421,6 +422,7 @@ void CheckExpandQ8_0(std::size_t m, std::size_t k, std::uint32_t seed) {
   CheckHip(hipFree(d_w), "expand weights free");
 }
 
+namespace qg = gufo::quant;
 /// A batch a few tokens past a full 128-token tile computes its tail with
 /// W8A8TailKernel; every row must equal the tiled kernel's row from a batch
 /// whose tail is too wide to split.
