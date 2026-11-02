@@ -251,6 +251,15 @@ const TextProvider* ProbeTextProvider(const core::GgufReader& reader) {
   return nullptr;
 }
 
+const TextProvider* ClaimTextProviderForFile(const std::string& model_path) {
+  for (const auto& provider : g_text_providers) {
+    if (provider.claim_file != nullptr && provider.claim_file(model_path)) {
+      return &provider;
+    }
+  }
+  return nullptr;
+}
+
 void RegisterToolDialect(ToolDialect dialect) {
   for (auto& existing : g_tool_dialects) {
     if (existing.format == dialect.format) {

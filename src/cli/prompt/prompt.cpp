@@ -361,6 +361,13 @@ int RunPrompt(std::span<const char* const> args) {
   }
 
   const auto model_load_start = std::chrono::steady_clock::now();
+  ext::Registry registry;
+  ext::RegisterBuiltExtensions(registry);
+  if (const auto* claimed = ext::ClaimTextProviderForFile(opt.model_path);
+      claimed != nullptr && claimed->prompt_driver != nullptr) {
+    return claimed->prompt_driver(opt, gufo::core::GgufReader::Empty(),
+                                  model_load_start);
+  }
   std::string err;
   auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader_owner) {
@@ -372,8 +379,6 @@ int RunPrompt(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
 
-  ext::Registry registry;
-  ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->prompt_driver == nullptr) {
     std::cerr << "Error: unsupported model architecture for prompt\n";
@@ -404,6 +409,13 @@ int RunChat(std::span<const char* const> args) {
   }
 
   const auto model_load_start = std::chrono::steady_clock::now();
+  ext::Registry registry;
+  ext::RegisterBuiltExtensions(registry);
+  if (const auto* claimed = ext::ClaimTextProviderForFile(opt.model_path);
+      claimed != nullptr && claimed->chat_driver != nullptr) {
+    return claimed->chat_driver(opt, gufo::core::GgufReader::Empty(),
+                                model_load_start);
+  }
   std::string err;
   auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader_owner) {
@@ -415,8 +427,6 @@ int RunChat(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
 
-  ext::Registry registry;
-  ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->chat_driver == nullptr) {
     std::cerr << "Error: unsupported model architecture for chat\n";
